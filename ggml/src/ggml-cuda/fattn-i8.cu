@@ -1,4 +1,5 @@
 #include "fattn-i8.cuh"
+#include "fattn-sage.cuh"
 #include "convert.cuh"
 #include "cp-async.cuh"
 
@@ -739,10 +740,14 @@ void ggml_cuda_flash_attn_ext_i8(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int n_part = (int) ((n_kv + I8_KSUM_ROWS - 1) / I8_KSUM_ROWS);
     ggml_cuda_pool_alloc<float>  kpart(ctx.pool(), (int64_t) n_part * H * I8_DQK);
     ggml_cuda_pool_alloc<float>  ksum(ctx.pool(), H * I8_DQK);
+    // f16 P*V with f16 accumulation (GGML_PREC_F16 on src 2): the SageAttention2-style kernel (fattn-sage.cu), with
+    // its own block-scaled int8 Q and K
+    const bool sage = ggml_get_op_params_i32(dst, 7) == GGML_PREC_F16 &&
+        ggml_cuda_info().devices[ctx.device].smpbo >= ggml_sage_smem();
     ggml_cuda_pool_alloc<int8_t> K8(ctx.pool(), H * n_kv * I8_DQK);
-    ggml_cuda_pool_alloc<float>  sk(ctx.pool(), H * n_kv);
+    ggml_cuda_pool_alloc<float>  sk(ctx.pool(), sage ? H * ggml_sage_k_scales(n_kv) : H * n_kv);
     ggml_cuda_pool_alloc<int8_t> Q8(ctx.pool(), H * n_q * I8_DQK);
-    ggml_cuda_pool_alloc<float>  sq(ctx.pool(), H * n_q);
+    ggml_cuda_pool_alloc<float>  sq(ctx.pool(), sage ? H * ggml_sage_q_scales(n_q) : H * n_q);
 
     // K (and V) may be f32 -> f16 copies the graph skipped (ggml_cuda_fattn_i8_cast_elidable): read their f32 source
     const bool k_f32 = ctx.fattn_i8_elided.count(K) != 0;
@@ -755,15 +760,30 @@ void ggml_cuda_flash_attn_ext_i8(ggml_backend_cuda_context & ctx, ggml_tensor * 
         fattn_i8_k_sum_partial<float><<<dim3(n_part, H), I8_DQK, 0, stream>>>(
             (const char *) Ks->data, kpart.get(), n_kv, Ks->nb[1], Ks->nb[2]);
         fattn_i8_k_sum_reduce<<<H, I8_DQK, 0, stream>>>(kpart.get(), ksum.get(), n_part, (int) H);
-        fattn_i8_quantize<float, true><<<k_grid, rows_per_block * WARP_SIZE, 0, stream>>>(
-            (const char *) Ks->data, ksum.get(), K8.get(), sk.get(), n_kv, Ks->nb[1], Ks->nb[2], 1.0f, 1.0f / (float) n_kv);
+        if (!sage) {
+            fattn_i8_quantize<float, true><<<k_grid, rows_per_block * WARP_SIZE, 0, stream>>>(
+                (const char *) Ks->data, ksum.get(), K8.get(), sk.get(), n_kv, Ks->nb[1], Ks->nb[2], 1.0f, 1.0f / (float) n_kv);
+        }
     } else {
         fattn_i8_k_sum_partial<half><<<dim3(n_part, H), I8_DQK, 0, stream>>>(
             (const char *) K->data, kpart.get(), n_kv, K->nb[1], K->nb[2]);
         fattn_i8_k_sum_reduce<<<H, I8_DQK, 0, stream>>>(kpart.get(), ksum.get(), n_part, (int) H);
-        fattn_i8_quantize<half, false><<<k_grid, rows_per_block * WARP_SIZE, 0, stream>>>(
-            (const char *) K->data, ksum.get(), K8.get(), sk.get(), n_kv, K->nb[1], K->nb[2], 1.0f, 1.0f / (float) n_kv);
+        if (!sage) {
+            fattn_i8_quantize<half, false><<<k_grid, rows_per_block * WARP_SIZE, 0, stream>>>(
+                (const char *) K->data, ksum.get(), K8.get(), sk.get(), n_kv, K->nb[1], K->nb[2], 1.0f, 1.0f / (float) n_kv);
+        }
     }
+    if (sage) {
+        GGML_ASSERT(!v_f32);
+        ggml_cuda_pool_alloc<int> flag(ctx.pool(), 1);
+        ggml_sage_quantize(Q->data, true, false, Q->nb[1], Q->nb[2], n_q, H, nullptr, Q8.get(), sq.get(), stream);
+        ggml_sage_quantize(Ks->data, k_f32, k_f32, Ks->nb[1], Ks->nb[2], n_kv, H, ksum.get(), K8.get(), sk.get(), stream);
+        ggml_sage_attn(Q8.get(), K8.get(), V->data, V->nb[1] / 2, V->nb[2] / 2, sq.get(), sk.get(), (float *) dst->data,
+            dst->nb[2] / sizeof(float), dst->nb[1] / sizeof(float), n_q, n_kv, H, scale, flag.get(), stream);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
     // Q * scale * log2(e): the softmax runs on exp2
     fattn_i8_quantize<float, false><<<dim3((n_q + rows_per_block - 1) / rows_per_block, H), rows_per_block * WARP_SIZE, 0, stream>>>(
         (const char *) Q->data, nullptr, Q8.get(), sq.get(), n_q, Q->nb[1], Q->nb[2], scale * 1.4426950408889634f, 0.0f);

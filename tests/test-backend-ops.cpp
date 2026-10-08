@@ -5184,7 +5184,7 @@ struct test_flash_attn_ext_i8 : public test_case {
     const bool acc16;
 
     std::string vars() override {
-        return VARS_TO_STR6(nh, n_q, n_kv, acc16, pv8, cast);
+        return VARS_TO_STR8(nh, n_q, n_kv, acc16, pv8, cast, fast, vscale);
     }
 
     double max_nmse_err() override {
@@ -5198,10 +5198,12 @@ struct test_flash_attn_ext_i8 : public test_case {
 
     const bool pv8 = false;
     const bool cast = false; // K and V as f16 copies of permuted f32 tensors (as the Tilde graph makes them)
+    const bool fast = false; // f16 P*V with f16 accumulation (GGML_PREC_F16 on V: CUDA fattn-sage.cu)
+    const float vscale = 1.0f; // V scaled (cast only): large values overflow f16 accumulation (the guard reruns in f32)
 
     test_flash_attn_ext_i8(int64_t nh = 4, int64_t n_q = 200, int64_t n_kv = 200, bool acc16 = false, bool pv8 = false,
-            bool cast = false)
-        : nh(nh), n_q(n_q), n_kv(n_kv), acc16(acc16), pv8(pv8), cast(cast) {}
+            bool cast = false, bool fast = false, float vscale = 1.0f)
+        : nh(nh), n_q(n_q), n_kv(n_kv), acc16(acc16), pv8(pv8), cast(cast), fast(fast), vscale(vscale) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 192, n_q,  nh);
@@ -5209,7 +5211,11 @@ struct test_flash_attn_ext_i8 : public test_case {
         ggml_tensor * v;
         if (cast) {
             k = ggml_cast(ctx, ggml_permute(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 192, nh, n_kv), 0, 2, 1, 3), GGML_TYPE_F16);
-            v = ggml_cast(ctx, ggml_permute(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, nh, n_kv), 0, 2, 1, 3), GGML_TYPE_F16);
+            ggml_tensor * vf = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, nh, n_kv);
+            if (vscale != 1.0f) {
+                vf = ggml_scale(ctx, vf, vscale);
+            }
+            v = ggml_cast(ctx, ggml_permute(ctx, vf, 0, 2, 1, 3), GGML_TYPE_F16);
         } else {
             k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 192, n_kv, nh);
             v = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_kv, nh);
@@ -5225,6 +5231,9 @@ struct test_flash_attn_ext_i8 : public test_case {
         ggml_prec_set_src(out, GGML_PREC_Q8, 1);
         if (pv8) {
             ggml_prec_set_src(out, GGML_PREC_Q8, 2);
+        }
+        if (fast) {
+            ggml_prec_set_src(out, GGML_PREC_F16, 2);
         }
         return out;
     }
@@ -12047,6 +12056,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_i8(4, 1000, 777, true, false, true));
     test_cases.emplace_back(new test_flash_attn_ext_i8(4, 1000, 777, false, true, true));
     test_cases.emplace_back(new test_flash_attn_ext_i8(2, 4096, 4096, false, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext_i8(4, 200, 200, false, false, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext_i8(4, 1000, 777, false, false, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext_i8(4, 1000, 777, false, false, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext_i8(2, 4096, 4096, false, false, true, true));
     // CUDA chunked prefill kernel (head_size 128, >= 64 tokens): scalar and KDA gates, partial last chunk,
     // several segments of 4096 tokens, v heads > q/k heads, permuted q/k, two sequences
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,   64, 1));
@@ -12162,6 +12175,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext_i8(16, 32768, 32768, true));
     test_cases.emplace_back(new test_flash_attn_ext_i8(16, 32768, 32768, false, true));
     test_cases.emplace_back(new test_flash_attn_ext_i8(16, 32768, 32768, false, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext_i8(16, 32768, 32768, false, false, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(192, 128, 16, {1, 1}, 32768, 32768, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(192, 128, 16, {1, 1},  4096,  4096, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     // KDA prefill (Ling-3.0 / Tilde shapes)

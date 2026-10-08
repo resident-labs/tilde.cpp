@@ -473,6 +473,15 @@ static bool tilde_fa_pv8() {
     return v;
 }
 
+// SageAttention2-style attention (TILDE_FA_FAST=1; off by default)
+static bool tilde_fa_fast() {
+    static const bool v = [] {
+        const char * env = getenv("TILDE_FA_FAST");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return v;
+}
+
 static bool tilde_fa_int8() {
     static const bool value = [] {
         const char * env = std::getenv("TILDE_FA_INT8");
@@ -818,7 +827,10 @@ ggml_tensor * llama_model_tilde::graph::build_layer_mla(ggml_tensor * cur, ggml_
             // the hint.
             ggml_prec_set_src(cur, GGML_PREC_Q8, 0);
             ggml_prec_set_src(cur, GGML_PREC_Q8, 1);
-            if (tilde_fa_pv8()) {
+            if (tilde_fa_fast()) {
+                // f16 P*V with f16 accumulation, SageAttention2-style (I8CX+FAST preset; CUDA fattn-sage.cu)
+                ggml_prec_set_src(cur, GGML_PREC_F16, 2);
+            } else if (tilde_fa_pv8()) {
                 ggml_prec_set_src(cur, GGML_PREC_Q8, 2); // int8 P*V too (speed preset, measured separately)
             }
         }
