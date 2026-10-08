@@ -20,6 +20,7 @@ enum server_decision_question_type {
 struct server_decision_option {
     std::string key;
     json description; // null if not provided
+    std::string text; // tilde: the option text given to the model
 };
 
 struct server_decision_question {
@@ -27,6 +28,11 @@ struct server_decision_question {
     server_decision_question_type type;
     json instructions;
     std::vector<server_decision_option> options; // in the order of the model outputs
+
+    // tilde
+    std::string              text;             // the instruction text given to the model
+    std::vector<std::string> legend;           // score: the description of each level
+    float                    noul_temperature = 0.0f; // noul: extra temperature for this answer, 0 if none
 };
 
 struct server_decision_context {
@@ -52,8 +58,13 @@ struct server_decision_context {
 
     // true if all the questions of a request go in one prompt, see fill_task_joint()
     bool is_joint() const {
-        return type == COMMON_DECISION_TYPE_CLEF;
+        return type == COMMON_DECISION_TYPE_CLEF || type == COMMON_DECISION_TYPE_TILDE;
     }
+
+    // tilde: request limits, read from the model metadata (rejected, never truncated)
+    size_t max_questions       = 0; // 0: no limit
+    size_t max_request_tokens  = 0; // state + all the questions
+    size_t max_question_tokens = 0; // state + one question
 
     // true if the prompt of the model has a place for images
     bool can_use_images() const {
@@ -122,6 +133,15 @@ private:
     std::string text_marker;
     size_t      max_head_tokens   = 0; // question + options
     size_t      max_option_tokens = 48;
+
+    // TILDE
+    llama_token              tilde_bos = LLAMA_TOKEN_NULL;
+    std::vector<llama_token> tilde_markers; // start, state, state end, question, options, decision
+    bool                     tilde_noul_normalize = false; // noul options are normalized (true first, default texts)
+
+    std::vector<server_decision_question> parse_questions_tilde(const json & body) const;
+    void fill_task_tilde(const json & state, const std::vector<server_decision_question> & questions, server_task & task) const;
+    json format_answer_tilde(const server_decision_question & question, const std::vector<float> & scores, json & answer) const;
 
     std::string render(
             const json & state,

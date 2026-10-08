@@ -2161,6 +2161,12 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         has_embd   = true;
     }
 
+    // joint decision heads output one score per option through the embeddings, never vocabulary logits
+    // (a 64k-token batch would otherwise reserve n_vocab floats for every token)
+    if (model.arch == LLM_ARCH_CLEF || model.arch == LLM_ARCH_TILDE) {
+        has_logits = false;
+    }
+
     size_t backend_float_count = 0;
     size_t backend_token_count = 0;
     size_t embd_layer_inp_float_count = 0;

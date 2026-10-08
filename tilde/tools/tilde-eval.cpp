@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <map>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -56,15 +57,48 @@ static record parse_record(const json & j) {
     return r;
 }
 
+// --profile: time every graph node (the scheduler synchronizes before each callback), grouped by op and by role
+struct profiler {
+    bool active = false;
+    std::chrono::steady_clock::time_point last;
+    std::map<std::string, double> by_op;
+    std::map<std::string, double> by_role;
+};
+
+static std::string node_role(const ggml_tensor * t) {
+    const std::string name = t->name;
+    // names are like "kda_attn-3", "ffn_moe_down-5"; drop the layer index
+    const size_t dash = name.rfind('-');
+    std::string base = dash == std::string::npos ? name : name.substr(0, dash);
+    if (base.empty() || base.rfind("node_", 0) == 0 || base.rfind("leaf_", 0) == 0) {
+        base = std::string("(") + ggml_op_desc(t) + ")";
+    }
+    return base;
+}
+
+static bool profile_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    auto * p = (profiler *) user_data;
+    if (ask) {
+        return p->active;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(now - p->last).count();
+    p->last = now;
+    p->by_op[ggml_op_desc(t)] += ms;
+    p->by_role[node_role(t)]  += ms;
+    return true;
+}
+
 static void usage(const char * argv0) {
     fprintf(stderr,
         "usage: %s -m MODEL.gguf --records IN.jsonl --out OUT.jsonl [-ngl N] [-t THREADS] [-fa on|off|auto]\n"
-        "          [--max-tokens N] [--limit N] [--repeat N]\n", argv0);
+        "          [--max-tokens N] [--limit N] [--repeat N] [--profile]\n", argv0);
 }
 
 int main(int argc, char ** argv) {
     std::string model_path, records_path, out_path, fa = "auto";
     int ngl = 999, threads = -1, max_tokens = 0, limit = -1, repeat = 1;
+    bool do_profile = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -80,6 +114,7 @@ int main(int argc, char ** argv) {
         else if (a == "--max-tokens") max_tokens = std::stoi(next());
         else if (a == "--limit") limit = std::stoi(next());
         else if (a == "--repeat") repeat = std::stoi(next());
+        else if (a == "--profile") do_profile = true;
         else { usage(argv[0]); return 1; }
     }
     if (model_path.empty() || records_path.empty() || out_path.empty()) {
@@ -124,6 +159,11 @@ int main(int argc, char ** argv) {
         cparams.n_threads = threads;
         cparams.n_threads_batch = threads;
     }
+    profiler prof;
+    if (do_profile) {
+        cparams.cb_eval           = profile_cb;
+        cparams.cb_eval_user_data = &prof;
+    }
     llama_context_ptr ctx(llama_init_from_model(model.get(), cparams));
     if (!ctx) {
         fprintf(stderr, "failed to create the context\n");
@@ -155,7 +195,14 @@ int main(int argc, char ** argv) {
                 const int32_t idx = batch.add(r.ids[i], (llama_pos) i, 0, true);
                 batch.tokens[idx].decision_order = order[i];
             }
+            // profile the last repetition only
+            prof.active = do_profile && rep == repeat - 1;
+            if (prof.active) {
+                prof.by_op.clear();
+                prof.by_role.clear();
+            }
             const auto t0 = std::chrono::steady_clock::now();
+            prof.last = t0;
             const int ret = llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get());
             if (ret != 0) {
                 fprintf(stderr, "%s: llama_process failed (%d)\n", r.id.c_str(), ret);
@@ -174,7 +221,12 @@ int main(int argc, char ** argv) {
             for (size_t j = 0; j < q.options.size(); j++) row.push_back(scores[k++]);
             logits.push_back(row);
         }
-        out << json{{"id", r.id}, {"n_tokens", r.ids.size()}, {"ms", ms}, {"logits", logits}}.dump() << "\n";
+        json row = {{"id", r.id}, {"n_tokens", r.ids.size()}, {"ms", ms}, {"logits", logits}};
+        if (do_profile) {
+            row["profile_by_op"]   = prof.by_op;
+            row["profile_by_role"] = prof.by_role;
+        }
+        out << row.dump() << "\n";
         out.flush();
     }
     fprintf(stderr, "done: %.1f s total model time\n", total_ms / 1000.0);

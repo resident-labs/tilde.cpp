@@ -316,13 +316,18 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
             break;
         case 192: {
             // MiMo-V2.5 / V2.5-Pro / V2-Flash: gqa_ratio is 8 (SWA) or 16 (full attn)
+            // MLA with decompressed K/V (non-causal prefill, e.g. tilde): no GQA, mask optional
             GGML_ASSERT(V->ne[0] == 128);
             float max_bias = 0.0f;
             memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
             const bool use_gqa_opt = mask && max_bias == 0.0f;
-            GGML_ASSERT(use_gqa_opt);
             GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
             const int gqa_ratio = Q->ne[2] / K->ne[2];
+            if (gqa_ratio == 1) {
+                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<192, 128,  1>(ctx, dst);
+                break;
+            }
+            GGML_ASSERT(use_gqa_opt);
             if (gqa_ratio % 16 == 0) {
                 ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<192, 128, 16>(ctx, dst);
             } else {
@@ -587,10 +592,17 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             }
             break;
         case 192:
-            if (V->ne[0] != 128 || !gqa_opt_applies) {
+            if (V->ne[0] != 128) {
                 return BEST_FATTN_KERNEL_NONE;
             }
-            if (gqa_ratio % 8 != 0) {
+            // GQA 8/16 (MiMo) needs the GQA optimization, no GQA (decompressed MLA) runs on the MMA kernel only
+            if (gqa_ratio == 1) {
+                if (!turing_mma_available(cc)) {
+                    return BEST_FATTN_KERNEL_NONE;
+                }
+                break;
+            }
+            if (!gqa_opt_applies || gqa_ratio % 8 != 0) {
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
