@@ -17,6 +17,8 @@
 #   JOBS      build parallelism (nproc)
 #   UPLOAD    1 = upload the results to the staging repo (default 1)
 #   GGUF_DIR  (dry runs) take the GGUFs from this directory instead of downloading them
+#   OFFLINE   1 = use what is already in $WORK/staging (no HF_TOKEN needed; with UPLOAD=0)
+#   KEEP      1 = keep the DEV-slice parity results that already exist in $WORK/results (reruns)
 # Needs: NVIDIA driver + CUDA toolkit >= 12.8 (nvcc), git, python3 (pip is used for cmake / hf if they are missing).
 set -euo pipefail
 
@@ -48,7 +50,9 @@ T0=$(date +%s)
 
 # --- tools -----------------------------------------------------------------------------------------------------------
 log "box: $(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader | head -1), $(nproc) cpus"
-[ -n "${HF_TOKEN:-}" ] || die "set HF_TOKEN (read/write on $STAGING)"
+OFFLINE=${OFFLINE:-0}
+KEEP=${KEEP:-0}
+[ -n "${HF_TOKEN:-}" ] || [ "$OFFLINE" = 1 ] || die "set HF_TOKEN (read/write on $STAGING)"
 # the toolkit's own nvcc (a bare nvcc on PATH may be a wrapper without the toolkit headers next to it)
 NVCC=${NVCC:-}
 [ -z "$NVCC" ] && [ -x /usr/local/cuda/bin/nvcc ] && NVCC=/usr/local/cuda/bin/nvcc
@@ -75,7 +79,7 @@ command -v git > /dev/null || die "no git"
 
 # --- inputs ----------------------------------------------------------------------------------------------------------
 # one pattern per call: hf download ignores --include when a file name is given
-fetch() { hf download "$STAGING" --include "$1" --local-dir "$WORK/staging" > /dev/null; }
+fetch() { [ "$OFFLINE" = 1 ] || hf download "$STAGING" --include "$1" --local-dir "$WORK/staging" > /dev/null; }
 log "downloading source, data and GGUFs from $STAGING"
 if [ -z "$COMMIT" ]; then
     fetch "src/LATEST"
@@ -134,11 +138,15 @@ for r in $RUNS; do
     pv=0; fast=0
     case "$r" in *+PV8) pv=1 ;; *+FAST) fast=1 ;; esac
     M=$S/gguf/tilde-8b-a1b-$p.gguf
+    if [ "$KEEP" = 1 ] && [ -s "$RES/par_$r.json" ]; then
+        log "$r: DEV slice parity kept from the earlier run"
+    else
     log "$r: DEV slice parity"
     TILDE_FA_PV8=$pv TILDE_FA_FAST=$fast $B/tilde-eval -m "$M" --records "$S/data/dev_slice.jsonl" --out "$RES/par_$r.jsonl" -ngl 999 \
         > "$RES/par_$r.log" 2>&1 || { tail -20 "$RES/par_$r.log"; die "tilde-eval failed ($r parity)"; }
     python3 "$WORK/src/tilde/parity/reference.py" compare --records "$S/data/dev_slice.jsonl" --ref "$S/data/ref_dev_slice.jsonl" \
         --test "$RES/par_$r.jsonl" --json "$RES/par_$r.json" > /dev/null
+    fi
     log "$r: 1k..64k sweep"
     vram_watch > "$RES/vram_$r.txt" & W=$!
     TILDE_FA_PV8=$pv TILDE_FA_FAST=$fast $B/tilde-eval -m "$M" --records "$S/data/bench_records.jsonl" --out "$RES/time_$r.jsonl" -ngl 999 \
