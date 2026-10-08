@@ -32,11 +32,14 @@ static const double GiB = 1024.0 * 1024.0 * 1024.0;
 struct preset {
     const char * tag;
     double       weights_mib;
+    double       extra_mib;  // runtime memory beyond runtime_mib() at a 65,536-token limit (int8 activation caches)
+    bool         auto_pick;  // chosen by free memory for an untagged -hf (I8CX needs a CUDA build with CUTLASS)
     const char * use;
 };
 static const preset PRESETS[] = {
-    { "Q8_0",  8389.0, "default" },
-    { "Q4_KE", 5077.0, "8-12 GB GPUs, Macs" },
+    { "Q8_0",  8389.0,   0.0, true,  "default" },
+    { "Q4_KE", 5077.0,   0.0, true,  "8-12 GB GPUs, Macs" },
+    { "I8CX",  7977.0, 600.0, false, "CUDA (Ampere or newer, built with GGML_CUDA_CUTLASS_DIR): fastest; TILDE_FA_FAST=1" },
 };
 
 // device memory beyond the weights for a request limit of n tokens (MiB), measured on a 3090 Ti (STATUS.md, "Memory"):
@@ -160,17 +163,19 @@ int main(int argc, char ** argv) {
     if (!m.empty() && !ec) {
         // a local file (wins over -hf when both are given)
         weights_mib = m_size / (1024.0 * 1024.0) - (dev.gpu ? HOST_ONLY_MIB : 0.0);
+        if (m.find("I8C") != std::string::npos) {
+            weights_mib += PRESETS[2].extra_mib; // int8 activation caches of the I8 GEMMs
+        }
     } else if (!hf.empty() && hf.find(':') == std::string::npos) {
-        const size_t n_presets = sizeof(PRESETS) / sizeof(PRESETS[0]);
-        const preset * pick = &PRESETS[n_presets - 1];
+        const preset * pick = &PRESETS[1];
         for (const auto & p : PRESETS) {
-            if (max_tokens(p.weights_mib + host_extra) >= 65536) {
+            if (p.auto_pick && max_tokens(p.weights_mib + p.extra_mib + host_extra) >= 65536) {
                 pick = &p;
                 break;
             }
         }
         chosen = pick->tag;
-        weights_mib = pick->weights_mib + host_extra;
+        weights_mib = pick->weights_mib + pick->extra_mib + host_extra;
         for (size_t i = 0; i + 1 < args.size(); i++) {
             if (args[i] == "-hf" || args[i] == "-hfr" || args[i] == "--hf-repo") {
                 args[i + 1] = hf + ":" + chosen;
@@ -182,7 +187,7 @@ int main(int argc, char ** argv) {
         weights_mib = PRESETS[0].weights_mib + host_extra;
         for (const auto & p : PRESETS) {
             if (tag == p.tag) {
-                weights_mib = p.weights_mib + host_extra;
+                weights_mib = p.weights_mib + p.extra_mib + host_extra;
                 chosen = p.tag;
             }
         }

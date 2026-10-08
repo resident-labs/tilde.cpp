@@ -86,17 +86,27 @@ or `-m <file>`.
 |---|---|---|---|---|---:|---|
 | Q8_0 | `tilde-8b-a1b-Q8_0.gguf` | Q8_0 | Q8_0 | f32 | 9.3 GB | default; GPUs with >= 16 GB, CPUs |
 | Q4_KE | `tilde-8b-a1b-Q4_KE.gguf` | Q4_K | Q8_0 | f32 | 5.8 GB | 8-12 GB GPUs, Macs |
+| I8CX | `tilde-8b-a1b-I8CX.gguf` | int8 + row scales | int8 + row scales (projections), Q8_0 | f32 | 8.9 GB | NVIDIA Ampere or newer with a CUTLASS build: the fastest (1.18 s at 32k on a 3090 Ti with `TILDE_FA_FAST=1`) |
+| NVFP4E | `tilde-8b-a1b-NVFP4E.gguf` | NVFP4 | Q8_0 | f32 | 5.8 GB | Blackwell GPUs (native FP4) |
 | MXFP4E | `tilde-8b-a1b-MXFP4E.gguf` | MXFP4 | Q8_0 | f32 | 5.4 GB | Blackwell GPUs (native FP4) |
 | BF16 | `tilde-8b-a1b-BF16.gguf` | bf16 | bf16 | f32 | 16.2 GB | reference |
 
 Every preset is gated against the PyTorch reference on DEV data (see "Parity"). The token embeddings stay in host
-memory, so they cost no VRAM.
+memory, so they cost no VRAM. `tilde-server` picks Q8_0 or Q4_KE by free memory; I8CX is chosen with the tag
+(`-hf resident-labs/tilde-8b-a1b-GGUF:I8CX`) or `-m`.
+
+Attention options on CUDA (environment of `tilde-server`), measured on 32k requests:
+- default: int8 Q*K^T, f16 P*V;
+- `TILDE_FA_PV8=1`: int8 P*V as well (5% faster);
+- `TILDE_FA_FAST=1`: a SageAttention2-style kernel (int8 Q*K^T with block scales, f16 P*V with f16 accumulation and an
+  overflow guard that reruns the layer in f32; 14% faster than the default, same DEV accuracy).
 
 ## Build
 
 ```sh
 git clone https://github.com/resident-labs/tilde.cpp && cd tilde.cpp
 cmake -B build -DGGML_CUDA=ON          # NVIDIA (CUDA 12.4+; int8 attention needs Ampere or newer)
+# add -DGGML_CUDA_CUTLASS_DIR=/path/to/cutlass (v3.9.2) for the I8CX preset's int8 GEMMs
 # cmake -B build -DGGML_HIP=ON         # AMD (ROCm)
 # cmake -B build -DGGML_METAL=ON       # Apple (default on macOS)
 # cmake -B build -DGGML_VULKAN=ON      # any Vulkan GPU (Intel, AMD, NVIDIA)
@@ -143,8 +153,13 @@ GB of RAM).
   token for token, applies the limits and returns the response shape above.
 - CUDA kernels:
   - int8 Q*K^T flash attention for unmasked long prefill (`ggml-cuda/fattn-i8.cu`), selected through
-    `ggml_prec_set_src`;
-  - a chunked gated-delta-net prefill (`ggml-cuda/gated_delta_net_chunked.cu`);
+    `ggml_prec_set_src`, with int8 P*V and a SageAttention2-style variant (`ggml-cuda/fattn-sage.cu`,
+    `ggml-cuda/vendor/sageattn`, Apache-2.0);
+  - int8 GEMMs for I8 weights with row scales (`ggml-cuda/mmi8.cu`, CUTLASS): dense, and grouped for the experts with
+    the SwiGLU and the router-weighted sum (plus shared expert and residual) in the epilogue passes;
+  - fused grouped MoE routing (`ggml-cuda/moe-route.cu`), warp-per-row RMS norms that also write the int8 rows of the
+    next GEMM, residual add + RMS norm;
+  - a chunked gated-delta-net prefill on TF32 tensor cores (`ggml-cuda/gated_delta_net_chunked.cu`);
   - non-GQA 192/128 MMA flash attention;
   - a transposed-concat fast path.
 - `tilde/`: the converter, quantization presets, `tilde-server`, and the parity and benchmark harness
@@ -152,8 +167,9 @@ GB of RAM).
 
 ## Parity
 
-See [STATUS.md](STATUS.md) for the per-preset table. In short, every shipped preset is within 0.5 accuracy points and
-+0.005 log loss of the bf16 PyTorch reference on 7,365 DEV fields.
+See [STATUS.md](STATUS.md) for the per-preset table. In short, Q8_0, Q6_KE, Q4_KE and I8CX (with every attention
+option) are within 0.5 accuracy points and +0.005 log loss of the bf16 PyTorch reference on 7,365 DEV fields; NVFP4E
+and MXFP4E (measured as W4A8 on Ampere) are within 1 point and +0.01.
 
 ## Benchmarks
 
