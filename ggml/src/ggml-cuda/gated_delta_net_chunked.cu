@@ -59,20 +59,24 @@ struct gdn_src {
     float scale;
 };
 
-static constexpr size_t GDN_INTRA_SMEM = (4 * GDN_D * GDN_TP + GDN_BT * GDN_TP + GDN_BT) * sizeof(float);
+// the intra kernel works on DP dims at a time (two sweeps: dot products, then outputs), which keeps its shared
+// memory small enough for several blocks per SM
+static constexpr int    GDN_DP         = 32;
+static constexpr size_t GDN_INTRA_SMEM = (4 * GDN_DP * GDN_TP + GDN_BT * GDN_TP + GDN_BT) * sizeof(float);
 
 __global__ void __launch_bounds__(GDN_THREADS) gdn_chunk_intra(const gdn_src src, float * __restrict__ tmp,
         const int64_t t0, const int n_chunks_seg) {
     constexpr int D  = GDN_D;
     constexpr int BT = GDN_BT;
     constexpr int TP = GDN_TP;
+    constexpr int DP = GDN_DP;
 
     extern __shared__ float smem[];
-    float * qT    = smem;                // [D][TP], later k e^G
-    float * kT    = qT + D * TP;         // [D][TP]
-    float * gT    = kT + D * TP;         // [D][TP]: g, then its cumsum G
-    float * vT    = gT + D * TP;         // [D][TP]
-    float * sM    = vT + D * TP;         // [BT][TP]: N -> T -> M
+    float * qT    = smem;                // [DP][TP]
+    float * kT    = qT + DP * TP;        // [DP][TP]
+    float * gT    = kT + DP * TP;        // [DP][TP]: g, then its cumsum G
+    float * vT    = gT + DP * TP;        // [DP][TP]
+    float * sM    = vT + DP * TP;        // [BT][TP]: N -> T -> M
     float * sBeta = sM + BT * TP;        // [BT]
 
     const int c   = blockIdx.x;
@@ -87,42 +91,44 @@ __global__ void __launch_bounds__(GDN_THREADS) gdn_chunk_intra(const gdn_src src
 
     float * out = tmp + ((int64_t) (seq * src.H + h) * n_chunks_seg + c) * gdn_layout::stride;
 
-    // ---- load q, k, v, g of the chunk (coalesced over d), transposed into [D][TP]
-    for (int idx = tid; idx < BT * D; idx += GDN_THREADS) {
-        const int t = idx / D;
-        const int d = idx % D;
-        float qv = 0.0f, kv = 0.0f, vv = 0.0f, gv = 0.0f;
-        if (t < nvalid) {
-            const int64_t tok = tc0 + t;
-            const int64_t qo  = sk * src.sq3 + tok * src.sq2 + hk * src.sq1 + d;
-            qv = src.q[qo];
-            kv = src.k[qo];
-            vv = src.v[seq * src.sv3 + tok * src.sv2 + h * src.sv1 + d];
-            const int64_t gb = seq * src.sb3 + tok * src.sb2 + h * src.sb1;
-            gv = src.kda ? src.g[gb * D + d] : src.g[gb];
+    // load dims [d0, d0 + DP) of q, k, g (and v) transposed into [DP][TP] (coalesced over d), then the gate cumsum
+    auto load_pass = [&](const int d0, const bool with_v) {
+        for (int idx = tid; idx < BT * DP; idx += GDN_THREADS) {
+            const int t = idx / DP;
+            const int d = idx % DP;
+            float qv = 0.0f, kv = 0.0f, vv = 0.0f, gv = 0.0f;
+            if (t < nvalid) {
+                const int64_t tok = tc0 + t;
+                const int64_t qo  = sk * src.sq3 + tok * src.sq2 + hk * src.sq1 + d0 + d;
+                qv = src.q[qo];
+                kv = src.k[qo];
+                if (with_v) {
+                    vv = src.v[seq * src.sv3 + tok * src.sv2 + h * src.sv1 + d0 + d];
+                }
+                const int64_t gb = seq * src.sb3 + tok * src.sb2 + h * src.sb1;
+                gv = src.kda ? src.g[gb * D + d0 + d] : src.g[gb];
+            }
+            qT[d * TP + t] = qv;
+            kT[d * TP + t] = kv;
+            vT[d * TP + t] = vv;
+            gT[d * TP + t] = gv;
         }
-        qT[d * TP + t] = qv;
-        kT[d * TP + t] = kv;
-        vT[d * TP + t] = vv;
-        gT[d * TP + t] = gv;
-    }
+        __syncthreads();
+        if (tid < DP) {
+            float G = 0.0f;
+            for (int t = 0; t < BT; t++) {
+                G += gT[tid * TP + t];
+                gT[tid * TP + t] = G;
+            }
+        }
+        __syncthreads();
+    };
+
     if (tid < BT) {
         sBeta[tid] = tid < nvalid ? src.beta[seq * src.sb3 + (tc0 + tid) * src.sb2 + h * src.sb1] : 0.0f;
     }
-    __syncthreads();
 
-    // ---- gate cumsum per dim
-    if (tid < D) {
-        float G = 0.0f;
-        for (int t = 0; t < BT; t++) {
-            G += gT[tid * TP + t];
-            gT[tid * TP + t] = G;
-        }
-        out[gdn_layout::GL + tid] = expf(G);
-    }
-    __syncthreads();
-
-    // ---- A[r][s] (s <= r) and N[r][s] (s < r): 2x2 tiles, 16x16 threads
+    // ---- sweep 1: A[r][s] (s <= r) and N[r][s] (s < r): 2x2 tiles, 16x16 threads
     {
         const int ti = tid / 16;
         const int tj = tid % 16;
@@ -131,29 +137,33 @@ __global__ void __launch_bounds__(GDN_THREADS) gdn_chunk_intra(const gdn_src src
         const bool active = tj <= ti;
         float accA[2][2] = {};
         float accN[2][2] = {};
-        if (active) {
+        for (int d0 = 0; d0 < D; d0 += DP) {
+            load_pass(d0, false);
+            if (active) {
 #pragma unroll 4
-            for (int d = 0; d < D; d++) {
-                const float * q  = qT + d * TP;
-                const float * kk = kT + d * TP;
-                const float * G  = gT + d * TP;
-                const float qa[2] = {q[r0], q[r0 + 1]};
-                const float ka[2] = {kk[r0], kk[r0 + 1]};
-                const float kb[2] = {kk[s0], kk[s0 + 1]};
-                const float ga[2] = {G[r0], G[r0 + 1]};
-                const float gb[2] = {G[s0], G[s0 + 1]};
+                for (int d = 0; d < DP; d++) {
+                    const float * q  = qT + d * TP;
+                    const float * kk = kT + d * TP;
+                    const float * G  = gT + d * TP;
+                    const float qa[2] = {q[r0], q[r0 + 1]};
+                    const float ka[2] = {kk[r0], kk[r0 + 1]};
+                    const float kb[2] = {kk[s0], kk[s0 + 1]};
+                    const float ga[2] = {G[r0], G[r0 + 1]};
+                    const float gb[2] = {G[s0], G[s0 + 1]};
 #pragma unroll
-                for (int a = 0; a < 2; a++) {
+                    for (int a = 0; a < 2; a++) {
 #pragma unroll
-                    for (int b = 0; b < 2; b++) {
-                        if (r0 + a >= s0 + b) {
-                            const float e = expf(ga[a] - gb[b]);
-                            accA[a][b] += qa[a] * kb[b] * e;
-                            accN[a][b] += ka[a] * kb[b] * e;
+                        for (int b = 0; b < 2; b++) {
+                            if (r0 + a >= s0 + b) {
+                                const float e = expf(ga[a] - gb[b]);
+                                accA[a][b] += qa[a] * kb[b] * e;
+                                accN[a][b] += ka[a] * kb[b] * e;
+                            }
                         }
                     }
                 }
             }
+            __syncthreads(); // the next pass overwrites the stage
         }
 #pragma unroll
         for (int a = 0; a < 2; a++) {
@@ -198,32 +208,43 @@ __global__ void __launch_bounds__(GDN_THREADS) gdn_chunk_intra(const gdn_src src
             sM[i * TP + j] = m;
         }
     }
-
-    // ---- QG^T, KL^T; then k e^G in place of q. thread -> (token cc = lane, 16 dims per warp)
-    const int cc = tid % 32;
-    const int dw = (tid / 32) * (D / 8);
-    for (int dd = 0; dd < D / 8; dd++) {
-        const int d = dw + dd;
-        const float G  = gT[d * TP + cc];
-        const float Gl = gT[d * TP + BT - 1];
-        const float kv = kT[d * TP + cc];
-        out[gdn_layout::QGT + d * BT + cc] = src.scale * qT[d * TP + cc] * expf(G);
-        out[gdn_layout::KLT + d * BT + cc] = kv * expf(Gl - G);
-        qT[d * TP + cc] = kv * expf(G);
-    }
     __syncthreads();
 
-    // ---- w = M (k e^G), u = M v, transposed
-    for (int dd = 0; dd < D / 8; dd++) {
-        const int d = dw + dd;
-        float w = 0.0f, u = 0.0f;
-        for (int j = 0; j <= cc; j++) {
-            const float m = sM[cc * TP + j];
-            w += m * qT[d * TP + j];
-            u += m * vT[d * TP + j];
+    // ---- sweep 2: QG^T, KL^T, exp(G_last), w = M (k e^G), u = M v. thread -> (token cc = lane, 4 dims per warp)
+    const int cc = tid % 32;
+    const int dw = (tid / 32) * (DP / 8);
+    for (int d0 = 0; d0 < D; d0 += DP) {
+        load_pass(d0, true);
+        if (tid < DP) {
+            out[gdn_layout::GL + d0 + tid] = expf(gT[tid * TP + BT - 1]);
         }
-        out[gdn_layout::WT + d * BT + cc] = w;
-        out[gdn_layout::UT + d * BT + cc] = u;
+        for (int dd = 0; dd < DP / 8; dd++) {
+            const int d = dw + dd;
+            const float G  = gT[d * TP + cc];
+            const float Gl = gT[d * TP + BT - 1];
+            const float kv = kT[d * TP + cc];
+            out[gdn_layout::QGT + (d0 + d) * BT + cc] = src.scale * qT[d * TP + cc] * expf(G);
+            out[gdn_layout::KLT + (d0 + d) * BT + cc] = kv * expf(Gl - G);
+        }
+        __syncthreads();
+        // k e^G in place of q
+        for (int dd = 0; dd < DP / 8; dd++) {
+            const int d = dw + dd;
+            qT[d * TP + cc] = kT[d * TP + cc] * expf(gT[d * TP + cc]);
+        }
+        __syncthreads();
+        for (int dd = 0; dd < DP / 8; dd++) {
+            const int d = dw + dd;
+            float w = 0.0f, u = 0.0f;
+            for (int j = 0; j <= cc; j++) {
+                const float m = sM[cc * TP + j];
+                w += m * qT[d * TP + j];
+                u += m * vT[d * TP + j];
+            }
+            out[gdn_layout::WT + (d0 + d) * BT + cc] = w;
+            out[gdn_layout::UT + (d0 + d) * BT + cc] = u;
+        }
+        __syncthreads(); // the next pass overwrites the stage
     }
 }
 
@@ -332,15 +353,21 @@ __global__ void __launch_bounds__(GDN_THREADS) gdn_chunk_inter(
         gdn_wait<2>();
         __syncthreads();
         if (!(dbg & 1)) {
-            float acc[4] = {};
-            for (int i = 0; i < D; i++) {
-                const float s  = sS[i * SP + n];
-                const float4 w = *(const float4 *) (sW + i * BT + c0);
-                acc[0] += w.x * s; acc[1] += w.y * s; acc[2] += w.z * s; acc[3] += w.w * s;
+            // two independent partial sums per output and an unrolled loop: the shared-memory latency, not the
+            // arithmetic, bounds this loop
+            float acc[2][4] = {};
+#pragma unroll 8
+            for (int i = 0; i < D; i += 2) {
+                const float s0 = sS[i * SP + n];
+                const float s1 = sS[(i + 1) * SP + n];
+                const float4 w0 = *(const float4 *) (sW + i * BT + c0);
+                const float4 w1 = *(const float4 *) (sW + (i + 1) * BT + c0);
+                acc[0][0] += w0.x * s0; acc[0][1] += w0.y * s0; acc[0][2] += w0.z * s0; acc[0][3] += w0.w * s0;
+                acc[1][0] += w1.x * s1; acc[1][1] += w1.y * s1; acc[1][2] += w1.z * s1; acc[1][3] += w1.w * s1;
             }
 #pragma unroll
             for (int r = 0; r < 4; r++) {
-                sVN[(c0 + r) * NV + n] = sU[n * BT + c0 + r] - acc[r];
+                sVN[(c0 + r) * NV + n] = sU[n * BT + c0 + r] - (acc[0][r] + acc[1][r]);
             }
         }
         __syncthreads();
@@ -352,10 +379,21 @@ __global__ void __launch_bounds__(GDN_THREADS) gdn_chunk_inter(
         __syncthreads();
         if (!(dbg & 2)) {
             float acc[4] = {};
-            for (int i = 0; i < D; i++) {
-                const float s  = sS[i * SP + n];
-                const float4 q = *(const float4 *) (sQ + i * BT + c0);
-                acc[0] += q.x * s; acc[1] += q.y * s; acc[2] += q.z * s; acc[3] += q.w * s;
+            {
+                float acc1[4] = {};
+#pragma unroll 8
+                for (int i = 0; i < D; i += 2) {
+                    const float s0 = sS[i * SP + n];
+                    const float s1 = sS[(i + 1) * SP + n];
+                    const float4 q0 = *(const float4 *) (sQ + i * BT + c0);
+                    const float4 q1 = *(const float4 *) (sQ + (i + 1) * BT + c0);
+                    acc[0] += q0.x * s0; acc[1] += q0.y * s0; acc[2] += q0.z * s0; acc[3] += q0.w * s0;
+                    acc1[0] += q1.x * s1; acc1[1] += q1.y * s1; acc1[2] += q1.z * s1; acc1[3] += q1.w * s1;
+                }
+#pragma unroll
+                for (int r = 0; r < 4; r++) {
+                    acc[r] += acc1[r];
+                }
             }
             for (int j = 0; j < c0 + 4; j++) {
                 const float vn = sVN[j * NV + n];

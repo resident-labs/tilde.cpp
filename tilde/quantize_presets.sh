@@ -8,7 +8,8 @@
 #   Q8_0     everything else Q8_0, the head's lexical table bf16             (default: any GPU with >= 12 GB, CPUs)
 #   Q6_KE    routed experts Q6_K, attention/dense/shared experts Q8_0          (16 GB cards with headroom)
 #   Q4_KE    routed experts Q4_K, attention/dense/shared experts Q8_0          (8-12 GB cards, Macs)
-#   MXFP4E   routed experts MXFP4, attention/dense/shared experts Q8_0         (Blackwell sm_120: native FP4 MMA)
+#   MXFP4E   routed experts MXFP4, attention/dense/shared experts Q8_0         (experimental: fails the parity gates)
+#   NVFP4E   routed experts NVFP4, attention/dense/shared experts Q8_0         (Blackwell sm_120: native FP4 MMA)
 # The file names follow the release layout: tilde-8b-a1b-<PRESET>.gguf
 set -euo pipefail
 
@@ -24,6 +25,7 @@ for preset in "$@"; do
         Q6_KE)  extra=(--tensor-type 'ffn_(gate|up|down)_exps=q6_K') ;;
         Q4_KE)  extra=(--tensor-type 'ffn_(gate|up|down)_exps=q4_K') ;;
         MXFP4E) extra=(--tensor-type 'ffn_(gate|up|down)_exps=mxfp4') ;;
+        NVFP4E) extra=(--tensor-type 'ffn_(gate|up|down)_exps=nvfp4') ;;
         *) echo "unknown preset $preset" >&2; exit 1 ;;
     esac
     "$BIN/llama-quantize" "${common[@]}" "${extra[@]}" "$IN" "$OUT/tilde-8b-a1b-$preset.gguf" Q8_0 8

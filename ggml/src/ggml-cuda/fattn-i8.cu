@@ -10,8 +10,11 @@
 //     leaves the softmax unchanged), then quantized to int8 with one scale per key;
 //   - Q is multiplied by the softmax scale and log2(e) and quantized to int8 with one scale per query;
 //   - S = Q K^T runs on int8 tensor cores (mma m16n8k32, int32 accumulation), then is rescaled per row and column;
-//   - the online softmax is in the exp2 domain; P (f16) V (f16) runs on f16 tensor cores with f32 accumulation.
+//   - the online softmax is in the exp2 domain; P (f16) V (f16) runs on f16 tensor cores. Within a tile of 64 keys
+//     it accumulates in f16 (GeForce cards run that at twice the f32-accumulate rate); the running output across
+//     tiles stays f32. GGML_CUDA_FATTN_I8_ACC16=0 accumulates every tile in f32 instead.
 // On a GeForce Ampere card the int8 path has 4x the tensor throughput of f16 with f32 accumulation.
+// Allowing int8 Q and K (GGML_PREC_Q8 on src 0 and 1) is what opts an op into these approximations.
 
 static constexpr int I8_DQK   = 192;
 static constexpr int I8_DV    = 128;
@@ -46,23 +49,37 @@ bool ggml_cuda_flash_attn_ext_i8_applies(int device, const ggml_tensor * dst) {
         Q->ne[0] == I8_DQK && K->ne[0] == I8_DQK && V->ne[0] == I8_DV &&
         Q->ne[2] == K->ne[2] && K->ne[2] == V->ne[2] && Q->ne[3] == 1 && K->ne[3] == 1 &&
         K->ne[1] == V->ne[1] && Q->ne[1] >= I8_BQ && K->ne[1] >= I8_BK &&
-        K->nb[0] == 2 && V->nb[0] == 2 && V->nb[1] % 16 == 0 && V->nb[2] % 16 == 0 &&
+        Q->nb[0] == sizeof(float) && K->nb[0] == 2 && V->nb[0] == 2 && V->nb[1] % 16 == 0 && V->nb[2] % 16 == 0 &&
         ggml_cuda_info().devices[device].smpbo >= (size_t) I8_SMEM;
 #endif
 }
 
-// sum of K over the keys, per head and dim (atomic partial sums)
-static __global__ void fattn_i8_k_sum(const char * __restrict__ K, float * __restrict__ ksum,
+// sum of K over the keys, per head and dim: partial sums of 256 keys per block, then a fixed-order reduction (no
+// atomics, so the result is the same on every run)
+static constexpr int I8_KSUM_ROWS = 256;
+
+static __global__ void fattn_i8_k_sum_partial(const char * __restrict__ K, float * __restrict__ part,
         const int64_t n_kv, const int64_t nbk1, const int64_t nbk2) {
     const int h = blockIdx.y;
     const int d = threadIdx.x;
-    const int64_t t0 = (int64_t) blockIdx.x * 256;
-    const int64_t t1 = min(t0 + 256, n_kv);
+    const int64_t t0 = (int64_t) blockIdx.x * I8_KSUM_ROWS;
+    const int64_t t1 = min(t0 + I8_KSUM_ROWS, n_kv);
     float s = 0.0f;
     for (int64_t t = t0; t < t1; t++) {
         s += __half2float(*(const half *) (K + h * nbk2 + t * nbk1 + d * 2));
     }
-    atomicAdd(&ksum[h * I8_DQK + d], s);
+    part[((int64_t) blockIdx.x * gridDim.y + h) * I8_DQK + d] = s;
+}
+
+static __global__ void fattn_i8_k_sum_reduce(const float * __restrict__ part, float * __restrict__ ksum,
+        const int n_part, const int H) {
+    const int h = blockIdx.x;
+    const int d = threadIdx.x;
+    float s = 0.0f;
+    for (int i = 0; i < n_part; i++) {
+        s += part[((int64_t) i * H + h) * I8_DQK + d];
+    }
+    ksum[h * I8_DQK + d] = s;
 }
 
 // one row (key or query) per warp: x = (src - mean) * mul, int8 with scale max|x| / 127
@@ -155,7 +172,7 @@ static __device__ __forceinline__ uint32_t i8_pack_half2(const float lo, const f
 }
 
 // acc16: P V of each tile accumulates in f16 (2x the f32-accumulate rate on GeForce cards), then joins the f32
-// output; allowed when the graph sets the accumulator precision to GGML_PREC_F16
+// output
 template <bool acc16>
 static __global__ void __launch_bounds__(I8_WARPS * WARP_SIZE, 1) fattn_i8_main(
         const int8_t * __restrict__ Q8, const float * __restrict__ sq_all,
@@ -389,15 +406,17 @@ void ggml_cuda_flash_attn_ext_i8(ggml_backend_cuda_context & ctx, ggml_tensor * 
     float scale = 1.0f;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
 
+    const int n_part = (int) ((n_kv + I8_KSUM_ROWS - 1) / I8_KSUM_ROWS);
+    ggml_cuda_pool_alloc<float>  kpart(ctx.pool(), (int64_t) n_part * H * I8_DQK);
     ggml_cuda_pool_alloc<float>  ksum(ctx.pool(), H * I8_DQK);
     ggml_cuda_pool_alloc<int8_t> K8(ctx.pool(), H * n_kv * I8_DQK);
     ggml_cuda_pool_alloc<float>  sk(ctx.pool(), H * n_kv);
     ggml_cuda_pool_alloc<int8_t> Q8(ctx.pool(), H * n_q * I8_DQK);
     ggml_cuda_pool_alloc<float>  sq(ctx.pool(), H * n_q);
 
-    CUDA_CHECK(cudaMemsetAsync(ksum.get(), 0, H * I8_DQK * sizeof(float), stream));
-    fattn_i8_k_sum<<<dim3((n_kv + 255) / 256, H), I8_DQK, 0, stream>>>(
-        (const char *) K->data, ksum.get(), n_kv, K->nb[1], K->nb[2]);
+    fattn_i8_k_sum_partial<<<dim3(n_part, H), I8_DQK, 0, stream>>>(
+        (const char *) K->data, kpart.get(), n_kv, K->nb[1], K->nb[2]);
+    fattn_i8_k_sum_reduce<<<H, I8_DQK, 0, stream>>>(kpart.get(), ksum.get(), n_part, (int) H);
     constexpr int rows_per_block = 8;
     fattn_i8_quantize<half><<<dim3((n_kv + rows_per_block - 1) / rows_per_block, H), rows_per_block * WARP_SIZE, 0, stream>>>(
         (const char *) K->data, ksum.get(), K8.get(), sk.get(), n_kv, K->nb[1], K->nb[2], 1.0f, 1.0f / (float) n_kv);
@@ -405,8 +424,9 @@ void ggml_cuda_flash_attn_ext_i8(ggml_backend_cuda_context & ctx, ggml_tensor * 
     fattn_i8_quantize<float><<<dim3((n_q + rows_per_block - 1) / rows_per_block, H), rows_per_block * WARP_SIZE, 0, stream>>>(
         (const char *) Q->data, nullptr, Q8.get(), sq.get(), n_q, Q->nb[1], Q->nb[2], scale * 1.4426950408889634f, 0.0f);
 
-    // f16 accumulation of P V when the graph allows it
-    const bool acc16 = ggml_get_op_params_i32(dst, 3) >= GGML_PREC_F16;
+    // f16 accumulation of P V within each key tile (see the top of the file)
+    const char * acc16_env = getenv("GGML_CUDA_FATTN_I8_ACC16");
+    const bool acc16 = acc16_env == nullptr || atoi(acc16_env) != 0;
 
     static bool smem_set[GGML_CUDA_MAX_DEVICES] = {};
     const int device = ggml_cuda_get_device();

@@ -1469,6 +1469,9 @@ extern "C" {
     //     - cannot quantize it down to GGML_TYPE_Q4_0 or GGML_TYPE_NVFP4
     //   - ggml_prec_set_src(a, GGML_PREC_Q4, 1):
     //     - allows the implementation to quantize F32, BF16, F16 data of src[1] down to 4-bit datatypes such as GGML_TYPE_Q4_K, GGML_TYPE_NVFP4 etc.
+    //   - GGML_OP_FLASH_ATTN_EXT, idx 0 (Q) and 1 (K), stored in op_params[5] and [6]:
+    //     - GGML_PREC_Q8 on both allows int8 Q*K^T (SageAttention-style: K smoothed by its mean, one scale per row,
+    //       P*V in f16 within a tile of keys); the CUDA backend implements it on Ampere and newer (fattn-i8.cu)
     //
     // return false on faliure
     GGML_API bool ggml_prec_set_src(

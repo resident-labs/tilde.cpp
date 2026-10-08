@@ -4792,7 +4792,8 @@ struct test_concat_transposed : public test_case {
     }
 };
 
-// GGML_OP_FLASH_ATTN_EXT with int8 Q and K allowed (CUDA: fattn-i8.cu), decompressed-MLA head sizes, no mask
+// GGML_OP_FLASH_ATTN_EXT with int8 Q and K allowed (CUDA: fattn-i8.cu), decompressed-MLA head sizes, no mask.
+// acc16 selects the CUDA kernel's per-tile f16 accumulation through GGML_CUDA_FATTN_I8_ACC16.
 struct test_flash_attn_ext_i8 : public test_case {
     const int64_t nh, n_q, n_kv;
     const bool acc16;
@@ -4818,7 +4819,12 @@ struct test_flash_attn_ext_i8 : public test_case {
         ggml_tensor * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 192, n_kv, nh);
         ggml_tensor * v = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_kv, nh);
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f / sqrtf(192.0f), 0.0f, 0.0f);
-        ggml_prec_set_acc(out, acc16 ? GGML_PREC_F16 : GGML_PREC_F32);
+#ifdef _WIN32
+        _putenv_s("GGML_CUDA_FATTN_I8_ACC16", acc16 ? "1" : "0");
+#else
+        setenv("GGML_CUDA_FATTN_I8_ACC16", acc16 ? "1" : "0", 1);
+#endif
+        ggml_prec_set_acc(out, GGML_PREC_F32);
         ggml_prec_set_src(out, GGML_PREC_Q8, 0);
         ggml_prec_set_src(out, GGML_PREC_Q8, 1);
         return out;

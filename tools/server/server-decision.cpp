@@ -267,6 +267,10 @@ static void decision_load_image(const json & url, std::vector<raw_buffer> & file
 }
 
 json server_decision_context::parse_state(const json & body, std::vector<raw_buffer> & files) const {
+    if (type == COMMON_DECISION_TYPE_TILDE) {
+        // tilde reads the state as given (text or JSON, image parts included as text), like tilda/serve.py
+        return body.contains("state") ? body.at("state") : json();
+    }
     if (body.contains("videos") && !body.at("videos").is_null() && !body.at("videos").empty()) {
         throw std::invalid_argument("\"videos\" is not supported");
     }
@@ -1188,12 +1192,8 @@ std::vector<server_decision_question> server_decision_context::parse_questions_t
         throw std::invalid_argument("state must be a string, object or array");
     }
     if (!questions.is_object() || questions.empty() || (max_questions > 0 && questions.size() > max_questions)) {
-        throw std::invalid_argument(string_format("provide 1-%zu questions", max_questions));
-    }
-
-    float default_noul_temperature = 0.0f;
-    if (body.contains("noul_temperature") && !body.at("noul_temperature").is_null()) {
-        default_noul_temperature = tilde_noul_temperature(body.at("noul_temperature"), "noul_temperature");
+        throw std::invalid_argument(max_questions > 0 ? string_format("provide 1-%zu questions", max_questions)
+                                                      : std::string("provide at least 1 question"));
     }
 
     std::vector<server_decision_question> out;
@@ -1267,16 +1267,23 @@ std::vector<server_decision_question> server_decision_context::parse_questions_t
             throw std::invalid_argument(qid + ": unsupported question type " + tilde_py_repr(kind));
         }
 
-        // the decisive yes/no profile of tilda/serve.py (question field > body field)
+        out.push_back(std::move(q));
+    }
+
+    // yes/no temperatures (question field > body field), checked after the questions like tilda/serve.py does
+    float default_noul_temperature = 0.0f;
+    if (body.contains("noul_temperature") && !body.at("noul_temperature").is_null()) {
+        default_noul_temperature = tilde_noul_temperature(body.at("noul_temperature"), "noul_temperature");
+    }
+    for (auto & q : out) {
+        const json & spec = questions.at(q.id);
         q.noul_temperature = q.type == SERVER_DECISION_QUESTION_NOUL ? default_noul_temperature : 0.0f;
         if (spec.contains("noul_temperature") && !spec.at("noul_temperature").is_null()) {
             if (q.type != SERVER_DECISION_QUESTION_NOUL) {
-                throw std::invalid_argument(qid + ": noul_temperature applies to noul questions only");
+                throw std::invalid_argument(q.id + ": noul_temperature applies to noul questions only");
             }
-            q.noul_temperature = tilde_noul_temperature(spec.at("noul_temperature"), qid + ": noul_temperature");
+            q.noul_temperature = tilde_noul_temperature(spec.at("noul_temperature"), q.id + ": noul_temperature");
         }
-
-        out.push_back(std::move(q));
     }
     return out;
 }

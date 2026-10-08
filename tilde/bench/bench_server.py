@@ -102,6 +102,7 @@ def main():
 
     bodies = [json.loads(line) for line in open(args.bodies) if line.strip()]
     proc = None
+    gpu_before = gpu_used_mib()  # whatever else holds GPU memory (desktop, a VRAM ballast): subtracted from the peaks
     t_start = time.time()
     if args.cmd:
         log = open(args.log or os.devnull, "w")
@@ -122,7 +123,7 @@ def main():
     ready_s = time.time() - t_start
     idle_gpu = gpu_used_mib()
     pid = proc.pid if proc else None
-    print(f"{args.label}: ready in {ready_s:.1f} s, GPU in use {idle_gpu} MiB, RSS {tree_rss_kb(pid) / 1024 if pid else 0:.0f} MiB")
+    print(f"{args.label}: ready in {ready_s:.1f} s, GPU in use {idle_gpu} MiB (before start {gpu_before}), RSS {tree_rss_kb(pid) / 1024 if pid else 0:.0f} MiB")
 
     rows = []
     with open(args.out, "a") as out:
@@ -146,13 +147,15 @@ def main():
                    "input_tokens": n, "cold_ms": round(cold_ms, 1), "warm_ms": round(w, 1) if w else None,
                    "warm_server_ms": statistics.median([x for x in server_ms if x is not None]) if server_ms else None,
                    "tokens_per_s": round(n / (w / 1000)) if w else None,
-                   "peak_gpu_mib": max(s.gpu, s2.gpu), "peak_rss_mib": round(max(s.rss, s2.rss) / 1024),
+                   "peak_gpu_mib": max(s.gpu, s2.gpu),
+                   "peak_gpu_server_mib": max(s.gpu, s2.gpu) - gpu_before if gpu_before is not None else None,
+                   "peak_rss_mib": round(max(s.rss, s2.rss) / 1024),
                    "ready_s": round(ready_s, 1), "idle_gpu_mib": idle_gpu}
             rows.append(row)
             out.write(json.dumps(row) + "\n")
             out.flush()
             print(f"  {row['id']}: {n} tokens, cold {row['cold_ms']} ms, warm {row['warm_ms']} ms, "
-                  f"{row['tokens_per_s']} tok/s, GPU {row['peak_gpu_mib']} MiB, RSS {row['peak_rss_mib']} MiB", flush=True)
+                  f"{row['tokens_per_s']} tok/s, GPU {row['peak_gpu_server_mib']} MiB, RSS {row['peak_rss_mib']} MiB", flush=True)
     if proc is not None:
         os.killpg(proc.pid, signal.SIGTERM)
         try:

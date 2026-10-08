@@ -3,7 +3,7 @@
 #include "common.cuh"
 
 // Chunked (prefill) form of GGML_OP_GATED_DELTA_NET for long batches: the per-token recurrence is replaced by
-// chunks of 16 tokens (the WY form of the delta rule, as in flash-linear-attention's chunk_kda / chunk_gated_delta_rule).
+// chunks of 32 tokens (the WY form of the delta rule, as in flash-linear-attention's chunk_kda / chunk_gated_delta_rule).
 // Returns false if the shape is not supported (the caller then runs the per-token kernel).
 bool ggml_cuda_gated_delta_net_chunked(
         ggml_backend_cuda_context & ctx,

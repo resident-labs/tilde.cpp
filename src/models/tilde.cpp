@@ -547,8 +547,8 @@ ggml_tensor * llama_model_tilde::graph::build_layer_kda(ggml_tensor * cur, int i
         x = ggml_reshape_3d(ctx0, x, d_inner, n_tokens, n_seqs);
         ggml_tensor * zeros  = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, d_conv - 1, d_inner, n_seqs), 0.0f);
         ggml_tensor * conv_x = ggml_concat(ctx0, zeros, ggml_transpose(ctx0, x), 0);
-        ggml_tensor * out    = ggml_ssm_conv(ctx0, conv_x, ggml_reshape_2d(ctx0, conv_w, d_conv, d_inner));
-        out = ggml_silu(ctx0, ggml_reshape_2d(ctx0, out, d_inner, n_tokens));
+        // silu directly on the conv output, so that the backends can fuse the two
+        ggml_tensor * out    = ggml_silu(ctx0, ggml_ssm_conv(ctx0, conv_x, ggml_reshape_2d(ctx0, conv_w, d_conv, d_inner)));
         return ggml_reshape_4d(ctx0, out, head_dim, n_head, n_tokens, n_seqs);
     };
 
@@ -673,15 +673,10 @@ ggml_tensor * llama_model_tilde::graph::build_layer_mla(ggml_tensor * cur, ggml_
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
         ggml_prec_set_acc(cur, GGML_PREC_F32);
         if (tilde_fa_int8()) {
-            // Q*K^T may run in int8 (CUDA, Ampere and newer: fattn-i8.cu); other backends ignore the hint.
-            // On CUDA the int8 kernel may also accumulate each 64-key tile of P*V in f16 (then f32 across tiles);
-            // the hint is CUDA-only because other backends would take it as f16 accumulation of the whole attention.
+            // Q*K^T may run in int8 (SageAttention-style; CUDA, Ampere and newer: fattn-i8.cu). Other backends ignore
+            // the hint.
             ggml_prec_set_src(cur, GGML_PREC_Q8, 0);
             ggml_prec_set_src(cur, GGML_PREC_Q8, 1);
-            ggml_backend_dev_t dev = model.dev_layer(il);
-            if (dev != nullptr && std::string(ggml_backend_dev_name(dev)).rfind("CUDA", 0) == 0) {
-                ggml_prec_set_acc(cur, GGML_PREC_F16);
-            }
         }
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0] * cur->ne[1], cur->ne[2] * cur->ne[3]);
     } else {

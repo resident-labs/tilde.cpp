@@ -1231,7 +1231,7 @@ private:
 
         // tilde: the whole request is one ubatch; a smaller ubatch lowers the request limit (rejected, never truncated)
         if (decision.type == COMMON_DECISION_TYPE_TILDE) {
-            const size_t n_ub = std::min(llama_n_ubatch(ctx_tgt), llama_n_ctx(ctx_tgt));
+            const size_t n_ub = std::min((size_t) llama_n_ubatch(ctx_tgt), (size_t) std::max(0, n_ctx_slot()));
             if (decision.max_request_tokens == 0 || decision.max_request_tokens > n_ub) {
                 SRV_WRN("tilde: requests are limited to %zu tokens by the ubatch/context size (the model accepts %zu)\n",
                         n_ub, decision.max_request_tokens);
@@ -5686,6 +5686,7 @@ void server_routes::init_routes() {
             }},
         };
         if (decision.type == COMMON_DECISION_TYPE_TILDE) {
+            out["usage"].erase("output_tokens"); // tilda/serve.py reports the input tokens only
             // the response of tilda/serve.py also carries the latency and echoes the request id
             out["latency_ms"] = std::round((ggml_time_us() - t_start_us) / 100.0) / 10.0;
             if (body.contains("request_id")) {
@@ -5707,6 +5708,14 @@ void server_routes::init_routes() {
             first->data   = safe_json_to_str(json{{"error", message}});
             return std::move(first);
         };
+        // body size cap (tilda/serve.py: TILDA_MAX_BODY, 413). 8 MiB holds any request within the token limits.
+        static const size_t max_body = [] {
+            const char * env = getenv("TILDE_MAX_BODY");
+            return env != nullptr && atoll(env) > 0 ? (size_t) atoll(env) : (size_t) 8 << 20;
+        }();
+        if (req.body.size() > max_body) {
+            return plain_error(413, string_format("body above %zu bytes", max_body));
+        }
         try {
             const json body = json::parse(req.body);
             if (!body.is_object()) {
@@ -5732,6 +5741,8 @@ void server_routes::init_routes() {
             return plain_error(400, e.what());
         } catch (const common_json_error & e) {
             return plain_error(400, e.what());
+        } catch (const std::exception & e) {
+            return plain_error(500, e.what());
         }
     };
 

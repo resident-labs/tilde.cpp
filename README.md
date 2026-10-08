@@ -1,134 +1,164 @@
-# llama.cpp
+# tilde.cpp
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+Run **Tilde**, the Resident Labs decision model, on your own machine: any NVIDIA, AMD, Apple or Intel GPU, or just a CPU.
+tilde.cpp is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) (base tag b11483). It adds the Tilde model,
+a `/v1/systemone` server and the kernels that make long requests fast.
 
-<div align="center">
+Tilde does not write text. It reads a **state** (any text or JSON) and a set of **questions**, all at once, and returns
+calibrated probabilities for every question's options:
 
-<b>LLM inference in C/C++</b>
+- `choice`: pick one of up to 255 options;
+- `noul`: yes or no;
+- `score`: a 2-10 level scale.
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
-[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
-[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+One forward pass answers all the questions together, up to 65,536 tokens per request.
 
-[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Ajhen0409%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3Aravi9%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Awine99%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
-
-</div>
+- Model: [`resident-labs/tilde-8b-a1b`](https://huggingface.co/resident-labs/tilde-8b-a1b): 7.9B parameters, ~1.3B active
+  per token (Ling-3.0-tiny backbone, 24 layers: 18 linear-attention KDA layers and 6 MLA layers that read the whole
+  request bidirectionally, 128-expert MoE), plus a joint decision head.
+- GGUF files: [`resident-labs/tilde-8b-a1b-GGUF`](https://huggingface.co/resident-labs/tilde-8b-a1b-GGUF).
+- Website: https://residentlabs.dev/
 
 ## Quick start
 
-A few options to get `llama.cpp` installed on your machine:
-
-```bash
-# curl
-curl -LsSf https://llama.app/install.sh | sh
-
-# powershell
-irm https://llama.app/install.ps1 | iex
+```sh
+# build (pick your backend, see "Build"), then:
+tilde-server                     # downloads the GGUF that fits your free memory, serves on http://127.0.0.1:8080
 ```
-
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
-
-Once installed:
 
 ```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
-
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+curl http://127.0.0.1:8080/v1/systemone -H "Content-Type: application/json" -d '{
+  "state": "Support ticket: I was charged twice for my order last week and nobody has replied.",
+  "questions": {
+    "team":    {"type": "choice", "instructions": "Which team should handle this?",
+                "criteria": {"billing": "payments and refunds", "shipping": "deliveries", "tech": "login and app problems"}},
+    "angry":   {"type": "noul",   "instructions": "Is the customer angry?"},
+    "urgency": {"type": "score",  "instructions": "How urgent is this?", "criteria": ["can wait", "this week", "today", "right now"]}
+  }
+}'
 ```
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
+The response looks like this:
 
-## Description
+```json
+{"model": "tilde-8b-a1b",
+ "answers": {
+   "team":    {"type": "choice", "choice": "billing", "probabilities": {"billing": 0.97, "shipping": 0.02, "tech": 0.01}, "confidence": 0.955},
+   "angry":   {"type": "noul", "noul": 0.81, "probabilities": {"true": 0.81, "false": 0.19}, "confidence": 0.62},
+   "urgency": {"type": "score", "score": 1.7, "legend": {"0": "can wait", "1": "this week", "2": "today", "3": "right now"},
+               "probabilities": {"0": 0.06, "1": 0.31, "2": 0.49, "3": 0.14}, "confidence": 0.32}},
+ "usage": {"input_tokens": 231, "output_tokens": 0}, "latency_ms": 41.2}
+```
 
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
+(The values above show the shape only, not a real answer.)
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+Docker (NVIDIA): `docker build -f tilde/docker/cuda.Dockerfile -t tilde-server:cuda .` and then
+`docker run --gpus all -p 8080:8080 -v tilde-cache:/root/.cache tilde-server:cuda`.
 
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
+## For agents
 
-## Supported backends
+- Endpoint: `POST /v1/systemone`, JSON body, `Content-Type: application/json`. Readiness: `GET /health` returns 200
+  once the model is loaded.
+- Body:
+  - `state`: string, object or array (required). Objects and arrays are given to the model as compact JSON.
+  - `questions`: object of 1-32 entries; `{id: {type, instructions, criteria}}`.
+    - `type` is `choice` | `noul` | `score`.
+    - `choice` criteria: object `{key: description or null}`, 1-255 entries.
+    - `score` criteria: array of 2-10 level descriptions, lowest first.
+    - `noul` criteria: optional `{true: ..., false: ...}`.
+  - Optional: `request_id` (echoed), and `noul_temperature` (> 0; per question or per request) to sharpen (< 1) or
+    soften (> 1) yes/no answers.
+- Answers come back in question order. `noul` is P(true). `choice` and `score` carry `probabilities` and `confidence`.
+  `score.score` is the expected level index.
+- Limits: 65,536 tokens per request (state + all questions), 32,768 tokens for the state plus any single question,
+  32 questions, 255 options. Over-limit requests are **rejected with HTTP 400** and a message saying which limit;
+  they are never truncated.
+- Errors: `{"error": "<message>"}` with 400 for bad requests.
+- Latency grows with request length. Plan for tens of milliseconds at 1k tokens and seconds at 32k-64k (see
+  "Benchmarks").
 
-| Backend | Target devices |
-| --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
+## Which file? (presets)
 
-## Documentation
+`tilde-server` picks the preset by free memory. To choose one yourself, use `-hf resident-labs/tilde-8b-a1b-GGUF:<preset>`
+or `-m <file>`.
 
-#### Tools
+| preset | file | experts | rest | head | size | for |
+|---|---|---|---|---|---:|---|
+| Q8_0 | `tilde-8b-a1b-Q8_0.gguf` | Q8_0 | Q8_0 | f32 | 9.3 GB | default; GPUs with >= 16 GB, CPUs |
+| Q4_KE | `tilde-8b-a1b-Q4_KE.gguf` | Q4_K | Q8_0 | f32 | 5.8 GB | 8-12 GB GPUs, Macs |
+| MXFP4E | `tilde-8b-a1b-MXFP4E.gguf` | MXFP4 | Q8_0 | f32 | 5.4 GB | Blackwell GPUs (native FP4) |
+| BF16 | `tilde-8b-a1b-BF16.gguf` | bf16 | bf16 | f32 | 16.2 GB | reference |
 
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
+Every preset is gated against the PyTorch reference on DEV data (see "Parity"). The token embeddings stay in host
+memory, so they cost no VRAM.
 
-#### Development
+## Build
 
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
+```sh
+git clone https://github.com/resident-labs/tilde.cpp && cd tilde.cpp
+cmake -B build -DGGML_CUDA=ON          # NVIDIA (CUDA 12.4+; int8 attention needs Ampere or newer)
+# cmake -B build -DGGML_HIP=ON         # AMD (ROCm)
+# cmake -B build -DGGML_METAL=ON       # Apple (default on macOS)
+# cmake -B build -DGGML_VULKAN=ON      # any Vulkan GPU (Intel, AMD, NVIDIA)
+# cmake -B build                       # CPU only
+cmake --build build -j --target tilde-server
+./build/bin/tilde-server
+```
 
-## Contributing
+`tilde-server` accepts every `llama-server` option, for example `--port`, `--host`, `--api-key` and `-ngl`. It sets
+these defaults:
 
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
+- `-c/-b/-ub` = the request limit (one request is one ubatch: the MLA layers read all of it);
+- `-np 1`;
+- `-fa on`;
+- the model alias `tilde-8b-a1b`;
+- `TILDE_CHUNK_TOKENS`, the MoE chunk size picked from free memory.
 
-## Acknowledgements
+The compute buffer for the largest request is reserved at startup, so a request that fits the limits never runs out
+of memory later. When the memory is too small for 65,536 tokens, the request limit is lowered (and logged), and
+longer requests are rejected.
 
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+## Convert your own checkpoint
+
+```sh
+pip install -r requirements.txt   # torch, safetensors, transformers, numpy
+python tilde/convert_tilde_to_gguf.py --base Ling-3.0-tiny-base/ --checkpoint stage1_final/ --temperature 1.26 \
+    --outtype bf16 --outfile tilde-8b-a1b-BF16.gguf
+tilde/quantize_presets.sh build/bin tilde-8b-a1b-BF16.gguf out/ Q8_0 Q4_KE MXFP4E
+python tilde/export_hf.py --base Ling-3.0-tiny-base/ --checkpoint stage1_final/ --temperature 1.26 --out tilde-8b-a1b/
+```
+
+The converter folds the fitted temperature into the head, verifies the checkpoint and base hashes, and streams (a few
+GB of RAM).
+
+## What tilde.cpp adds to llama.cpp
+
+- `src/models/tilde.cpp`: the `tilde` architecture. It has:
+  - non-causal MLA with K and V decompressed from the latent;
+  - KDA from zero state;
+  - MoE in token chunks;
+  - the joint decision head in the graph (span pooling sized for 64k tokens, flash attention for the head's
+    cross-attention).
+- `tools/server/server-decision.cpp`: the `tilde` decision type. It encodes requests exactly like the training code,
+  token for token, applies the limits and returns the response shape above.
+- CUDA kernels:
+  - int8 Q*K^T flash attention for unmasked long prefill (`ggml-cuda/fattn-i8.cu`), selected through
+    `ggml_prec_set_src`;
+  - a chunked gated-delta-net prefill (`ggml-cuda/gated_delta_net_chunked.cu`);
+  - non-GQA 192/128 MMA flash attention;
+  - a transposed-concat fast path.
+- `tilde/`: the converter, quantization presets, `tilde-server`, and the parity and benchmark harness
+  (`tilde/README.md`).
+
+## Parity
+
+See [STATUS.md](STATUS.md) for the per-preset table. In short, every shipped preset is within 0.5 accuracy points and
++0.005 log loss of the bf16 PyTorch reference on 7,365 DEV fields.
+
+## Benchmarks
+
+See [STATUS.md](STATUS.md). All numbers there are measured; none are extrapolated.
+
+## License
+
+MIT, like llama.cpp (see LICENSE). The model weights carry their own license on Hugging Face.
