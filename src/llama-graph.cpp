@@ -1593,10 +1593,13 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * ids,
           ggml_tensor * w_s,
           ggml_tensor * slots) const {
+    // int8 experts carry one scale per output row of each expert, applied by the op itself
+    const bool i8_scaled = w_s != nullptr && w->type == GGML_TYPE_I8 && slots == nullptr;
+
     // the experts in the MoE cache are selected by their slots
-    ggml_tensor * res = slots == nullptr ?
-        ggml_mul_mat_id(ctx0, w, cur, ids) :
-        ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur, slots);
+    ggml_tensor * res = i8_scaled       ? ggml_mul_mat_id_scaled(ctx0, w, w_s, cur, ids) :
+                        slots == nullptr ? ggml_mul_mat_id(ctx0, w, cur, ids) :
+                                           ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur, slots);
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -1606,7 +1609,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         ggml_prec_set_acc(res, GGML_PREC_BF16);
     }
 
-    if (w_s) {
+    if (w_s && !i8_scaled) {
         const int64_t n_expert = w_s->ne[0];
         const int64_t n_tokens = cur->ne[2];
         ggml_tensor * s = ggml_reshape_3d(ctx0, w_s, 1, n_expert, 1);

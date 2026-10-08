@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Make the CUDA "I8C" Tilde GGUF: the dense matmul weights as int8 with one f32 scale per output row (W8 per channel),
+"""Make the CUDA "I8C" Tilde GGUF: the matmul weights of the backbone (dense projections and routed experts) as int8
+with one f32 scale per output row (W8 per channel),
 for the int8 tensor-core GEMM path (per-token int8 activations, int32 accumulation, scales applied in the epilogue).
-Everything else is copied from a source GGUF (normally the Q8_0 preset; the int8 rows are made from the BF16 file).
+Everything else is copied from a source GGUF (the merged-experts Q8_0 preset; the int8 rows are made from the BF16
+file). The experts `blk.N.ffn_gate_up_exps` [E, 2I, H] (gate rows, then up rows) and `ffn_down_exps` get scales
+`<name>.scale` [E, rows]. --no-experts keeps the experts of the source file.
 
     python tilde/make_i8c.py --bf16 tilde-8b-a1b-BF16.gguf --base tilde-8b-a1b-Q8_0.gguf --out tilde-8b-a1b-I8C.gguf
 
@@ -39,6 +42,8 @@ def main() -> None:
     ap.add_argument("--bf16", type=Path, required=True, help="BF16 GGUF (source of the int8 rows)")
     ap.add_argument("--base", type=Path, required=True, help="GGUF whose other tensors are copied (Q8_0 preset)")
     ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--experts", action=argparse.BooleanOptionalAction, default=True,
+                    help="also the routed experts as int8 with a scale per row of each expert (default on)")
     args = ap.parse_args()
 
     ref = gguf.GGUFReader(args.bf16)
@@ -56,7 +61,14 @@ def main() -> None:
 
     plan = []
     for t in base.tensors:
-        if DENSE.match(t.name):
+        if args.experts and re.match(r"^blk\.\d+\.ffn_(gate_up|down)_exps\.weight$", t.name):
+            if "gate_up" in t.name:
+                parts = [src[t.name.replace("gate_up", "gate")], src[t.name.replace("gate_up", "up")]]
+            else:
+                parts = [src[t.name]]
+            plan.append(("i8x", t.name, parts, 0))
+            plan.append(("scalex", t.name.replace(".weight", ".scale"), parts, 0))
+        elif DENSE.match(t.name):
             if t.name not in src:
                 raise SystemExit(f"{t.name} missing in {args.bf16}")
             rows = int(t.shape[1]) if len(t.shape) >= 2 else 1
@@ -66,7 +78,13 @@ def main() -> None:
             plan.append(("copy", t.name, t, 0))
 
     for kind, name, t, rows in plan:
-        if kind == "copy":
+        if kind in ("i8x", "scalex"):
+            e, n, k = int(t[0].shape[2]), sum(int(p.shape[1]) for p in t), int(t[0].shape[0])
+            if kind == "i8x":
+                writer.add_tensor_info(name, [e, n, k], np.dtype(np.int8), e * n * k, gguf.GGMLQuantizationType.I8)
+            else:
+                writer.add_tensor_info(name, [e, n], np.dtype(np.float32), e * n * 4, gguf.GGMLQuantizationType.F32)
+        elif kind == "copy":
             writer.add_tensor_info(name, t.data.shape, t.data.dtype, t.data.nbytes, t.tensor_type)
         elif kind == "i8":
             k = int(t.shape[0])
@@ -81,6 +99,17 @@ def main() -> None:
     for kind, name, t, rows in plan:
         if kind == "copy":
             writer.write_tensor_data(t.data, tensor_endianess=base.endianess)
+            continue
+        if kind in ("i8x", "scalex"):
+            if name.replace(".scale", ".weight") not in cache:
+                w = np.concatenate([to_f32(p) for p in t], axis=1)          # [E, N, K], gate rows then up rows
+                sc = np.maximum(np.abs(w).max(axis=2), 1e-12) / 127.0      # [E, N]
+                q = np.clip(np.rint(w / sc[:, :, None]), -127, 127).astype(np.int8)
+                cache = {name.replace(".scale", ".weight"): (q, sc.astype(np.float32))}
+                del w
+                n += 1
+            q, sc = cache[name.replace(".scale", ".weight")]
+            writer.write_tensor_data(q if kind == "i8x" else sc)
             continue
         if t.name not in cache:
             w = to_f32(t)                                           # [rows, K]

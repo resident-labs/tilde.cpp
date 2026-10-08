@@ -1506,6 +1506,16 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
+    // indirect matrix multiplication with GGML_TYPE_I8 experts (integer codes) and one f32 scale per output row of each
+    // expert: as_scale is [as->ne[1], n_expert], dst[i, j, t] = as_scale[i, e] * sum_k as[k, i, e] * b[k, j, t] for the
+    // expert e = ids[j, t] (stored as src[3] of the MUL_MAT_ID node)
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_scaled(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as,
+            struct ggml_tensor  * as_scale,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows

@@ -21,6 +21,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <numeric>
 #include <atomic>
 #include <array>
 #include <cfloat>
@@ -4843,6 +4844,135 @@ struct test_mul_mat_i8 : public test_case {
                 ggml_backend_tensor_set(t, v.data(), 0, v.size());
             } else if (strcmp(t->name, "s") == 0) {
                 init_tensor_uniform(t, 0.001f, 0.01f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// MUL_MAT_ID with I8 experts and per-row-per-expert scales (CUDA: grouped int8 GEMM)
+struct test_mul_mat_id_i8 : public test_case {
+    const int64_t n_mats, n_used, m, n, k, ne11;
+    const bool scaled;
+
+    std::string vars() override {
+        return VARS_TO_STR7(n_mats, n_used, m, n, k, ne11, scaled);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4; // per-token int8 activations
+    }
+
+    test_mul_mat_id_i8(int64_t n_mats = 16, int64_t n_used = 4, int64_t m = 64, int64_t n = 33, int64_t k = 256,
+            int64_t ne11 = 1, bool scaled = true)
+        : n_mats(n_mats), n_used(n_used), m(m), n(n), k(k), ne11(ne11), scaled(scaled) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as  = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, k, m, n_mats);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_set_name(ids, "ids");
+        ggml_tensor * b   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, ne11, n);
+        if (scaled) {
+            ggml_tensor * s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n_mats);
+            ggml_set_name(s, "s");
+            return ggml_mul_mat_id_scaled(ctx, as, s, b, ids);
+        }
+        return ggml_mul_mat_id(ctx, as, b, ids);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(4321);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I8) {
+                std::uniform_int_distribution<int> d(-127, 127);
+                std::vector<int8_t> v(ggml_nelements(t));
+                for (auto & x : v) {
+                    x = (int8_t) d(rng);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size());
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> v(ggml_nelements(t));
+                for (int64_t r = 0; r < t->ne[1]; r++) {
+                    std::vector<int32_t> perm(n_mats);
+                    std::iota(perm.begin(), perm.end(), 0);
+                    std::shuffle(perm.begin(), perm.end(), rng);
+                    for (int64_t c = 0; c < t->ne[0]; c++) {
+                        v[r * t->ne[0] + c] = perm[c];
+                    }
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(int32_t));
+            } else if (strcmp(t->name, "s") == 0) {
+                init_tensor_uniform(t, 0.001f, 0.01f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// I8 experts in the MoE pattern of llm_graph_context::build_moe_ffn: gate_up -> SwiGLU -> down -> router-weighted sum
+// (CUDA fuses the SwiGLU and the weighted sum into the grouped int8 GEMMs)
+struct test_moe_i8 : public test_case {
+    const int64_t n_mats, n_used, n_embd, n_ff, n_tokens;
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_mats, n_used, n_embd, n_ff, n_tokens);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_moe_i8(int64_t n_mats = 16, int64_t n_used = 4, int64_t n_embd = 256, int64_t n_ff = 128, int64_t n_tokens = 70)
+        : n_mats(n_mats), n_used(n_used), n_embd(n_embd), n_ff(n_ff), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gu   = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, n_embd, 2 * n_ff, n_mats);
+        ggml_tensor * gu_s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * n_ff, n_mats);
+        ggml_tensor * dn   = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, n_ff, n_embd, n_mats);
+        ggml_tensor * dn_s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_mats);
+        ggml_set_name(gu_s, "s");
+        ggml_set_name(dn_s, "s");
+        ggml_tensor * ids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
+        ggml_tensor * w    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n_tokens);
+        ggml_tensor * x    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n_tokens);
+        ggml_tensor * gate_up = ggml_mul_mat_id_scaled(ctx, gu, gu_s, x, ids);
+        ggml_tensor * g = ggml_view_3d(ctx, gate_up, n_ff, n_used, n_tokens, gate_up->nb[1], gate_up->nb[2], 0);
+        ggml_tensor * u = ggml_view_3d(ctx, gate_up, n_ff, n_used, n_tokens, gate_up->nb[1], gate_up->nb[2], n_ff * gate_up->nb[0]);
+        ggml_tensor * h = ggml_swiglu_split(ctx, g, u);
+        ggml_tensor * experts = ggml_mul(ctx, ggml_mul_mat_id_scaled(ctx, dn, dn_s, h, ids), w);
+        ggml_tensor * out = nullptr;
+        for (int64_t i = 0; i < n_used; i++) {
+            ggml_tensor * v = ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], i * experts->nb[1]);
+            out = out == nullptr ? v : ggml_add(ctx, out, v);
+        }
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(777);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I8) {
+                std::uniform_int_distribution<int> d(-127, 127);
+                std::vector<int8_t> v(ggml_nelements(t));
+                for (auto & x : v) {
+                    x = (int8_t) d(rng);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size());
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> v(ggml_nelements(t));
+                for (int64_t r = 0; r < t->ne[1]; r++) {
+                    std::vector<int32_t> perm(n_mats);
+                    std::iota(perm.begin(), perm.end(), 0);
+                    std::shuffle(perm.begin(), perm.end(), rng);
+                    for (int64_t c = 0; c < t->ne[0]; c++) {
+                        v[r * t->ne[0] + c] = perm[c];
+                    }
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size() * sizeof(int32_t));
+            } else if (strcmp(t->name, "s") == 0) {
+                init_tensor_uniform(t, 0.0005f, 0.002f);
             } else {
                 init_tensor_uniform(t);
             }
@@ -11741,6 +11871,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  200, 2, 1, true,  true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 2, 128, 9000, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 2, 128, 4100, 1));
+    test_cases.emplace_back(new test_moe_i8());
+    test_cases.emplace_back(new test_moe_i8(128, 8, 1536, 512, 300));
+    test_cases.emplace_back(new test_mul_mat_id_i8());
+    test_cases.emplace_back(new test_mul_mat_id_i8(16, 4, 64, 33, 256, 1, false));
+    test_cases.emplace_back(new test_mul_mat_id_i8(32, 8, 1024, 300, 1536, 1));
+    test_cases.emplace_back(new test_mul_mat_id_i8(32, 8, 1536, 300, 512, 8));
     test_cases.emplace_back(new test_mul_mat_i8());
     test_cases.emplace_back(new test_mul_mat_i8(64, 70, 256, false));
     test_cases.emplace_back(new test_mul_mat_i8(1024, 333, 1536));
@@ -11835,6 +11971,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 32768, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  4096, 1, 1, false, true));
     test_cases.emplace_back(new test_mul_mat_i8(2048, 32768, 1536));
+    test_cases.emplace_back(new test_mul_mat_id_i8(128, 8, 1024, 8192, 1536, 1));
+    test_cases.emplace_back(new test_mul_mat_id_i8(128, 8, 1536, 8192, 512, 8));
     // Tilde / Ling-3.0-tiny matmuls at a 32k prefill: a dense projection, the MoE gate_up and down (8192-token chunks)
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048, 32768, 1536, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 8, false, 1024, 8192, 1536));

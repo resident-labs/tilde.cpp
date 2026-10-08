@@ -3435,6 +3435,22 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+struct ggml_tensor * ggml_mul_mat_id_scaled(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as,
+        struct ggml_tensor  * as_scale,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids) {
+    GGML_ASSERT(as->type == GGML_TYPE_I8);
+    GGML_ASSERT(as_scale->type == GGML_TYPE_F32 && ggml_is_contiguous(as_scale));
+    GGML_ASSERT(as_scale->ne[0] == as->ne[1] && as_scale->ne[1] == as->ne[2] && as_scale->ne[2] == 1 && as_scale->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_mul_mat_id(ctx, as, b, ids);
+    result->src[3] = as_scale;
+
+    return result;
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {

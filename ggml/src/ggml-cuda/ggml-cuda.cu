@@ -2010,6 +2010,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
 
+    if (src0->type == GGML_TYPE_I8) {
+        ggml_cuda_mul_mat_id_i8(ctx, dst, dst->src[3] != nullptr ? (const float *) dst->src[3]->data : nullptr, dst);
+        return;
+    }
+
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
@@ -3565,6 +3570,35 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    // I8 experts: the dequantization joins the next op (SwiGLU of gate_up, or the router-weighted sum of down)
+    if (node->op == GGML_OP_MUL_MAT_ID && node->src[0]->type == GGML_TYPE_I8 &&
+            ggml_cuda_mul_mat_id_i8_supported(cuda_ctx->device, node)) {
+        const float * w_scale = node->src[3] != nullptr ? (const float *) node->src[3]->data : nullptr;
+        ggml_cuda_moe_weighted_reduction_match match;
+        if (i + 1 < cgraph->n_nodes && ggml_node_has_n_uses(cgraph, i, 1) &&
+                ggml_cuda_match_moe_weighted_reduction(cgraph, i + 1, match) && match.experts == node &&
+                match.expert_scale == nullptr) {
+            ggml_cuda_mul_mat_id_i8(*cuda_ctx, node, w_scale, match.dst, MMID_I8_REDUCE, match.weights);
+            return match.node_count;
+        }
+        if (i + 3 < cgraph->n_nodes && ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_GLU }, { i + 3 })) {
+            const ggml_tensor * g   = cgraph->nodes[i + 1];
+            const ggml_tensor * u   = cgraph->nodes[i + 2];
+            ggml_tensor *       glu = cgraph->nodes[i + 3];
+            const int64_t half = node->ne[0] / 2;
+            auto is_half = [&](const ggml_tensor * v, size_t offs) {
+                return v->view_src == node && v->view_offs == offs && v->ne[0] == half && v->ne[1] == node->ne[1] &&
+                    v->ne[2] == node->ne[2] && v->nb[1] == node->nb[1] && v->nb[2] == node->nb[2];
+            };
+            if (ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU && ggml_get_op_params_i32(glu, 1) == 0 &&
+                    glu->src[0] == g && glu->src[1] == u && is_half(g, 0) && is_half(u, half * sizeof(float)) &&
+                    glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) && half % 4 == 0) {
+                ggml_cuda_mul_mat_id_i8(*cuda_ctx, node, w_scale, glu, MMID_I8_SWIGLU);
+                return 3;
+            }
+        }
+    }
+
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
@@ -4714,6 +4748,28 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 break;
             }
         }
+        // I8 experts: the fused epilogues (mmi8.cu) write the result of the following nodes while the MUL_MAT_ID runs,
+        // so its inputs must stay allocated until that result is
+        for (int i = 0; i + 1 < cgraph->n_nodes; ++i) {
+            ggml_tensor * mm = cgraph->nodes[i];
+            if (mm->op != GGML_OP_MUL_MAT_ID || mm->src[0]->type != GGML_TYPE_I8) {
+                continue;
+            }
+            ggml_tensor * fused_dst = nullptr;
+            ggml_cuda_moe_weighted_reduction_match match;
+            if (ggml_cuda_match_moe_weighted_reduction(cgraph, i + 1, match) && match.experts == mm) {
+                fused_dst = match.dst;
+                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.weights), fused_dst);
+            } else if (i + 3 < cgraph->n_nodes && cgraph->nodes[i + 3]->op == GGML_OP_GLU) {
+                fused_dst = cgraph->nodes[i + 3];
+            }
+            if (fused_dst != nullptr) {
+                for (int j = 1; j < GGML_MAX_SRC && mm->src[j] != nullptr; ++j) {
+                    params->add_alloc_dep(params->user_data, mm->src[j], fused_dst);
+                }
+                params->add_alloc_dep(params->user_data, mm, fused_dst);
+            }
+        }
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             ggml_cuda_moe_weighted_reduction_match match;
             if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
@@ -5411,7 +5467,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
 #endif // GGML_USE_MUSA
                 if (a->type == GGML_TYPE_I8) {
-                    return op->op == GGML_OP_MUL_MAT && ggml_cuda_mul_mat_i8_supported(dev_ctx->device, op);
+                    return op->op == GGML_OP_MUL_MAT ? ggml_cuda_mul_mat_i8_supported(dev_ctx->device, op) :
+                                                       ggml_cuda_mul_mat_id_i8_supported(dev_ctx->device, op);
                 }
                 switch (a->type) {
                     case GGML_TYPE_F32:

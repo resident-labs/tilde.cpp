@@ -1583,6 +1583,30 @@ static void ggml_compute_forward_mul_mat_id(
     const struct ggml_tensor * src1 = dst->src[1];
     const struct ggml_tensor * ids = dst->src[2];
 
+    if (src0->type == GGML_TYPE_I8) {
+        // integer-valued expert weights (the per-row scales are applied by the graph): plain f32 dot products
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && src0->nb[0] == 1 && src1->nb[0] == sizeof(float));
+        const int64_t K = src0->ne[0], M = src0->ne[1], n_used = ids->ne[0], n_tok = ids->ne[1];
+        for (int64_t m = params->ith; m < M; m += params->nth) {
+            for (int64_t t = 0; t < n_tok; t++) {
+                for (int64_t s = 0; s < n_used; s++) {
+                    const int32_t e = *(const int32_t *) ((const char *) ids->data + s * ids->nb[0] + t * ids->nb[1]);
+                    const int8_t * w = (const int8_t *) ((const char *) src0->data + e * src0->nb[2] + m * src0->nb[1]);
+                    const float  * x = (const float *) ((const char *) src1->data + (s % src1->ne[1]) * src1->nb[1] + t * src1->nb[2]);
+                    float sum = 0.0f;
+                    for (int64_t k = 0; k < K; k++) {
+                        sum += (float) w[k] * x[k];
+                    }
+                    if (dst->src[3] != NULL) {
+                        sum *= ((const float *) dst->src[3]->data)[e * src0->ne[1] + m];
+                    }
+                    *(float *) ((char *) dst->data + m * dst->nb[0] + s * dst->nb[1] + t * dst->nb[2]) = sum;
+                }
+            }
+        }
+        return;
+    }
+
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int ith = params->ith;

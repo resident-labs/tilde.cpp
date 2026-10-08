@@ -110,7 +110,9 @@ void llama_model_tilde::load_arch_tensors(llama_model_loader & ml) {
     // I8 weights carry one f32 scale per output row, `<name>.scale` (tilde/make_i8c.py)
     auto load_scale = [&](ggml_tensor * w, llm_tensor kind, int il) {
         if (w != nullptr && w->type == GGML_TYPE_I8) {
-            row_scales[w] = create_tensor(tn(kind, "scale", il), { w->ne[1] }, 0);
+            // experts [K, N, E]: one scale per row of each expert, [N, E]
+            row_scales[w] = w->ne[2] > 1 ? create_tensor(tn(kind, "scale", il), { w->ne[1], w->ne[2] }, 0)
+                                         : create_tensor(tn(kind, "scale", il), { w->ne[1] }, 0);
         }
     };
     for (int il = 0; il < n_layer; ++il) {
@@ -133,6 +135,8 @@ void llama_model_tilde::load_arch_tensors(llama_model_loader & ml) {
         load_scale(layer.ffn_gate_shexp, LLM_TENSOR_FFN_GATE_SHEXP, il);
         load_scale(layer.ffn_up_shexp,   LLM_TENSOR_FFN_UP_SHEXP,   il);
         load_scale(layer.ffn_down_shexp, LLM_TENSOR_FFN_DOWN_SHEXP, il);
+        load_scale(layer.ffn_gate_up_exps, LLM_TENSOR_FFN_GATE_UP_EXPS, il);
+        load_scale(layer.ffn_down_exps,    LLM_TENSOR_FFN_DOWN_EXPS,    il);
         // the generic per-tensor scale pass of llama_model must not create these names again
         layer.wq_s             = row_scale(layer.wq);
         layer.wk_s             = row_scale(layer.wk);
@@ -146,6 +150,8 @@ void llama_model_tilde::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_gate_shexp_s = row_scale(layer.ffn_gate_shexp);
         layer.ffn_up_shexp_s   = row_scale(layer.ffn_up_shexp);
         layer.ffn_down_shexp_s = row_scale(layer.ffn_down_shexp);
+        layer.ffn_up_exps_s    = row_scale(layer.ffn_gate_up_exps); // the merged gate_up path takes the up scale
+        layer.ffn_down_exps_s  = row_scale(layer.ffn_down_exps);
     }
 
     // decision head (same tensors as clef)
@@ -543,7 +549,7 @@ llama_model_tilde::graph::graph(const llama_model & model_base, const llm_graph_
                     hparams.expert_weights_norm,
                     hparams.expert_weights_scale,
                     (llama_expert_gating_func_type) hparams.expert_gating_func,
-                    il, nullptr, layer.ffn_gate_up_exps);
+                    il, nullptr, layer.ffn_gate_up_exps, layer.ffn_up_exps_s, nullptr, layer.ffn_down_exps_s);
             ggml_tensor * shared = build_ffn(cur,
                     layer.ffn_up_shexp,   nullptr, model.row_scale(layer.ffn_up_shexp),
                     layer.ffn_gate_shexp, nullptr, model.row_scale(layer.ffn_gate_shexp),
