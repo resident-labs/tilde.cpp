@@ -1,0 +1,429 @@
+#include "fattn-i8.cuh"
+#include "convert.cuh"
+#include "cp-async.cuh"
+
+// Flash attention with int8 Q*K^T (SageAttention-style) for long prefill without a mask.
+//
+// Used when the graph allows int8 Q and K (ggml_prec_set_src(fa, GGML_PREC_Q8, 0/1)), for the head sizes of
+// decompressed MLA (DKQ 192, DV 128), one K/V head per Q head, no mask, sinks, ALiBi or softcap, on Ampere or newer.
+//   - K is smoothed (the mean key of each head is subtracted, which shifts every score of a row by the same amount and
+//     leaves the softmax unchanged), then quantized to int8 with one scale per key;
+//   - Q is multiplied by the softmax scale and log2(e) and quantized to int8 with one scale per query;
+//   - S = Q K^T runs on int8 tensor cores (mma m16n8k32, int32 accumulation), then is rescaled per row and column;
+//   - the online softmax is in the exp2 domain; P (f16) V (f16) runs on f16 tensor cores with f32 accumulation.
+// On a GeForce Ampere card the int8 path has 4x the tensor throughput of f16 with f32 accumulation.
+
+static constexpr int I8_DQK   = 192;
+static constexpr int I8_DV    = 128;
+static constexpr int I8_BQ    = 128;  // queries per block (16 per warp)
+static constexpr int I8_BK    = 64;   // keys per tile
+static constexpr int I8_WARPS = 8;
+static constexpr int I8_KSTR  = I8_DQK + 16;       // bytes per key row in shared memory (bank-conflict padding)
+static constexpr int I8_VSTR  = (I8_DV + 8) * 2;   // bytes per value row in shared memory
+static constexpr int I8_STAGE = I8_BK * I8_KSTR + I8_BK * I8_VSTR + I8_BK * (int) sizeof(float);
+static constexpr int I8_SMEM  = 2 * I8_STAGE;
+
+bool ggml_cuda_flash_attn_ext_i8_applies(int device, const ggml_tensor * dst) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(device, dst);
+    return false;
+#else
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    if (dst->src[3] != nullptr || dst->src[4] != nullptr) {
+        return false; // mask or sinks
+    }
+    float max_bias = 0.0f, softcap = 0.0f;
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&softcap,  (const float *) dst->op_params + 2, sizeof(float));
+    const int32_t prec_q = ggml_get_op_params_i32(dst, 5);
+    const int32_t prec_k = ggml_get_op_params_i32(dst, 6);
+    const int cc = ggml_cuda_info().devices[device].cc;
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_AMPERE && cc >= GGML_CUDA_CC_AMPERE &&
+        prec_q >= GGML_PREC_Q8 && prec_k >= GGML_PREC_Q8 && max_bias == 0.0f && softcap == 0.0f &&
+        Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
+        Q->ne[0] == I8_DQK && K->ne[0] == I8_DQK && V->ne[0] == I8_DV &&
+        Q->ne[2] == K->ne[2] && K->ne[2] == V->ne[2] && Q->ne[3] == 1 && K->ne[3] == 1 &&
+        K->ne[1] == V->ne[1] && Q->ne[1] >= I8_BQ && K->ne[1] >= I8_BK &&
+        K->nb[0] == 2 && V->nb[0] == 2 && V->nb[1] % 16 == 0 && V->nb[2] % 16 == 0 &&
+        ggml_cuda_info().devices[device].smpbo >= (size_t) I8_SMEM;
+#endif
+}
+
+// sum of K over the keys, per head and dim (atomic partial sums)
+static __global__ void fattn_i8_k_sum(const char * __restrict__ K, float * __restrict__ ksum,
+        const int64_t n_kv, const int64_t nbk1, const int64_t nbk2) {
+    const int h = blockIdx.y;
+    const int d = threadIdx.x;
+    const int64_t t0 = (int64_t) blockIdx.x * 256;
+    const int64_t t1 = min(t0 + 256, n_kv);
+    float s = 0.0f;
+    for (int64_t t = t0; t < t1; t++) {
+        s += __half2float(*(const half *) (K + h * nbk2 + t * nbk1 + d * 2));
+    }
+    atomicAdd(&ksum[h * I8_DQK + d], s);
+}
+
+// one row (key or query) per warp: x = (src - mean) * mul, int8 with scale max|x| / 127
+template <typename T>
+static __global__ void fattn_i8_quantize(const char * __restrict__ src, const float * __restrict__ mean,
+        int8_t * __restrict__ dst, float * __restrict__ scales, const int64_t n_rows, const int64_t nb1,
+        const int64_t nb2, const float mul, const float inv_n_mean) {
+    constexpr int per_lane = I8_DQK / WARP_SIZE; // 6
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int64_t row = (int64_t) blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
+    const int h = blockIdx.y;
+    if (row >= n_rows) {
+        return;
+    }
+    const char * s = src + h * nb2 + row * nb1;
+    float x[per_lane];
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < per_lane; i++) {
+        const int d = lane * 2 + (i / 2) * 64 + (i % 2); // pairs: 2 consecutive dims per lane per 64-dim block
+        float v = ggml_cuda_cast<float>(((const T *) s)[d]);
+        if (mean != nullptr) {
+            v -= mean[h * I8_DQK + d] * inv_n_mean;
+        }
+        v *= mul;
+        x[i] = v;
+        amax = fmaxf(amax, fabsf(v));
+    }
+    amax = warp_reduce_max(amax);
+    const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+    const float inv = 1.0f / scale;
+    int8_t * o = dst + ((int64_t) h * n_rows + row) * I8_DQK;
+#pragma unroll
+    for (int i = 0; i < per_lane; i++) {
+        const int d = lane * 2 + (i / 2) * 64 + (i % 2);
+        o[d] = (int8_t) __float2int_rn(fminf(127.0f, fmaxf(-127.0f, x[i] * inv)));
+    }
+    if (lane == 0) {
+        scales[(int64_t) h * n_rows + row] = scale;
+    }
+}
+
+static __device__ __forceinline__ void i8_mma_s8(int (&c)[4], const int (&a)[4], const int b0, const int b1) {
+#ifdef AMPERE_MMA_AVAILABLE
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+        : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    GGML_UNUSED_VARS(c, a, b0, b1);
+    NO_DEVICE_CODE;
+#endif // AMPERE_MMA_AVAILABLE
+}
+
+static __device__ __forceinline__ void i8_mma_f16(float (&c)[4], const uint32_t (&a)[4], const uint32_t b0, const uint32_t b1) {
+#ifdef AMPERE_MMA_AVAILABLE
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    GGML_UNUSED_VARS(c, a, b0, b1);
+    NO_DEVICE_CODE;
+#endif // AMPERE_MMA_AVAILABLE
+}
+
+static __device__ __forceinline__ void i8_mma_f16_acc16(uint32_t (&c)[2], const uint32_t (&a)[4], const uint32_t b0, const uint32_t b1) {
+#ifdef AMPERE_MMA_AVAILABLE
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%0, %1};"
+        : "+r"(c[0]), "+r"(c[1])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    GGML_UNUSED_VARS(c, a, b0, b1);
+    NO_DEVICE_CODE;
+#endif // AMPERE_MMA_AVAILABLE
+}
+
+static __device__ __forceinline__ void i8_ldmatrix_x4_trans(uint32_t (&r)[4], const void * smem_ptr) {
+#ifdef AMPERE_MMA_AVAILABLE
+    const unsigned int addr = ggml_cuda_cvta_generic_to_shared((void *) smem_ptr);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
+        : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
+#else
+    GGML_UNUSED_VARS(r, smem_ptr);
+    NO_DEVICE_CODE;
+#endif // AMPERE_MMA_AVAILABLE
+}
+
+static __device__ __forceinline__ uint32_t i8_pack_half2(const float lo, const float hi) {
+    const half2 h = __floats2half2_rn(lo, hi);
+    return *(const uint32_t *) &h;
+}
+
+// acc16: P V of each tile accumulates in f16 (2x the f32-accumulate rate on GeForce cards), then joins the f32
+// output; allowed when the graph sets the accumulator precision to GGML_PREC_F16
+template <bool acc16>
+static __global__ void __launch_bounds__(I8_WARPS * WARP_SIZE, 1) fattn_i8_main(
+        const int8_t * __restrict__ Q8, const float * __restrict__ sq_all,
+        const int8_t * __restrict__ K8, const float * __restrict__ sk_all,
+        const char * __restrict__ V, float * __restrict__ dst,
+        const int64_t n_q, const int64_t n_kv, const int64_t nbv1, const int64_t nbv2,
+        const int64_t nbd1, const int64_t nbd2) {
+#ifdef AMPERE_MMA_AVAILABLE
+    extern __shared__ __align__(16) char smem[];
+
+    const int h    = blockIdx.y;
+    const int q0   = blockIdx.x * I8_BQ;
+    const int tid  = threadIdx.x;
+    const int lane = tid % WARP_SIZE;
+    const int warp = tid / WARP_SIZE;
+    const int g    = lane / 4;
+    const int tq   = lane % 4;
+
+    const int8_t * Kh  = K8 + (int64_t) h * n_kv * I8_DQK;
+    const float  * skh = sk_all + (int64_t) h * n_kv;
+    const char   * Vh  = V + h * nbv2;
+
+    // Q fragments for 16 rows x 192 dims: 6 k-steps of 32
+    const int64_t r0 = q0 + warp * 16 + g;
+    const int64_t r1 = r0 + 8;
+    int qa[I8_DQK / 32][4];
+    {
+        const int8_t * Qh = Q8 + (int64_t) h * n_q * I8_DQK;
+#pragma unroll
+        for (int ks = 0; ks < I8_DQK / 32; ks++) {
+            const int off = ks * 32 + tq * 4;
+            qa[ks][0] = r0 < n_q ? *(const int *) (Qh + r0 * I8_DQK + off)      : 0;
+            qa[ks][1] = r1 < n_q ? *(const int *) (Qh + r1 * I8_DQK + off)      : 0;
+            qa[ks][2] = r0 < n_q ? *(const int *) (Qh + r0 * I8_DQK + off + 16) : 0;
+            qa[ks][3] = r1 < n_q ? *(const int *) (Qh + r1 * I8_DQK + off + 16) : 0;
+        }
+    }
+    const float sq0 = r0 < n_q ? sq_all[(int64_t) h * n_q + r0] : 0.0f;
+    const float sq1 = r1 < n_q ? sq_all[(int64_t) h * n_q + r1] : 0.0f;
+
+    float O[I8_DV / 8][4] = {};
+    float m0 = -INFINITY, m1 = -INFINITY;
+    float l0 = 0.0f, l1 = 0.0f;
+
+    const int n_tiles = (int) ((n_kv + I8_BK - 1) / I8_BK);
+
+    auto load_tile = [&](const int kt, const int stage) {
+        char * sK  = smem + stage * I8_STAGE;
+        char * sV  = sK + I8_BK * I8_KSTR;
+        float * sS = (float *) (sV + I8_BK * I8_VSTR);
+        const int64_t k0 = (int64_t) kt * I8_BK;
+        // K: 64 rows x 12 chunks of 16 bytes
+        for (int c = tid; c < I8_BK * (I8_DQK / 16); c += I8_WARPS * WARP_SIZE) {
+            const int row = c / (I8_DQK / 16);
+            const int col = c % (I8_DQK / 16);
+            char * d = sK + row * I8_KSTR + col * 16;
+            if (k0 + row < n_kv) {
+                cp_async_cg_16<0>(ggml_cuda_cvta_generic_to_shared(d), Kh + (k0 + row) * I8_DQK + col * 16);
+            } else {
+                *(int4 *) d = make_int4(0, 0, 0, 0);
+            }
+        }
+        // V: 64 rows x 16 chunks of 16 bytes
+        for (int c = tid; c < I8_BK * (I8_DV * 2 / 16); c += I8_WARPS * WARP_SIZE) {
+            const int row = c / (I8_DV * 2 / 16);
+            const int col = c % (I8_DV * 2 / 16);
+            char * d = sV + row * I8_VSTR + col * 16;
+            if (k0 + row < n_kv) {
+                cp_async_cg_16<0>(ggml_cuda_cvta_generic_to_shared(d), Vh + (k0 + row) * nbv1 + col * 16);
+            } else {
+                *(int4 *) d = make_int4(0, 0, 0, 0);
+            }
+        }
+        if (tid < I8_BK) {
+            sS[tid] = k0 + tid < n_kv ? skh[k0 + tid] : 0.0f;
+        }
+    };
+
+    load_tile(0, 0);
+    asm volatile("cp.async.commit_group;");
+
+    for (int kt = 0; kt < n_tiles; kt++) {
+        const int stage = kt % 2;
+        if (kt + 1 < n_tiles) {
+            load_tile(kt + 1, stage ^ 1);
+        }
+        asm volatile("cp.async.commit_group;");
+        asm volatile("cp.async.wait_group 1;");
+        __syncthreads();
+
+        const char  * sK = smem + stage * I8_STAGE;
+        const char  * sV = sK + I8_BK * I8_KSTR;
+        const float * sS = (const float *) (sV + I8_BK * I8_VSTR);
+        const int64_t k0 = (int64_t) kt * I8_BK;
+
+        // S = Q K^T: 8 n-tiles of 8 keys
+        int c[I8_BK / 8][4] = {};
+#pragma unroll
+        for (int ks = 0; ks < I8_DQK / 32; ks++) {
+#pragma unroll
+            for (int nt = 0; nt < I8_BK / 8; nt++) {
+                const char * kr = sK + (nt * 8 + g) * I8_KSTR + ks * 32 + tq * 4;
+                i8_mma_s8(c[nt], qa[ks], *(const int *) kr, *(const int *) (kr + 16));
+            }
+        }
+
+        // rescale, mask keys past the end, online softmax (exp2 domain)
+        float s[I8_BK / 8][4];
+        float mt0 = -INFINITY, mt1 = -INFINITY;
+#pragma unroll
+        for (int nt = 0; nt < I8_BK / 8; nt++) {
+            const int j = nt * 8 + 2 * tq;
+            const float ska = sS[j];
+            const float skb = sS[j + 1];
+            const bool va = k0 + j < n_kv;
+            const bool vb = k0 + j + 1 < n_kv;
+            s[nt][0] = va ? (float) c[nt][0] * sq0 * ska : -INFINITY;
+            s[nt][1] = vb ? (float) c[nt][1] * sq0 * skb : -INFINITY;
+            s[nt][2] = va ? (float) c[nt][2] * sq1 * ska : -INFINITY;
+            s[nt][3] = vb ? (float) c[nt][3] * sq1 * skb : -INFINITY;
+            mt0 = fmaxf(mt0, fmaxf(s[nt][0], s[nt][1]));
+            mt1 = fmaxf(mt1, fmaxf(s[nt][2], s[nt][3]));
+        }
+        mt0 = fmaxf(mt0, __shfl_xor_sync(0xFFFFFFFF, mt0, 1));
+        mt0 = fmaxf(mt0, __shfl_xor_sync(0xFFFFFFFF, mt0, 2));
+        mt1 = fmaxf(mt1, __shfl_xor_sync(0xFFFFFFFF, mt1, 1));
+        mt1 = fmaxf(mt1, __shfl_xor_sync(0xFFFFFFFF, mt1, 2));
+        const float mn0 = fmaxf(m0, mt0);
+        const float mn1 = fmaxf(m1, mt1);
+        const float a0 = exp2f(m0 - mn0);
+        const float a1 = exp2f(m1 - mn1);
+        m0 = mn0;
+        m1 = mn1;
+        l0 *= a0;
+        l1 *= a1;
+#pragma unroll
+        for (int nt = 0; nt < I8_DV / 8; nt++) {
+            O[nt][0] *= a0; O[nt][1] *= a0;
+            O[nt][2] *= a1; O[nt][3] *= a1;
+        }
+        uint32_t p[I8_BK / 8][2];
+#pragma unroll
+        for (int nt = 0; nt < I8_BK / 8; nt++) {
+            const float p0 = exp2f(s[nt][0] - mn0);
+            const float p1 = exp2f(s[nt][1] - mn0);
+            const float p2 = exp2f(s[nt][2] - mn1);
+            const float p3 = exp2f(s[nt][3] - mn1);
+            l0 += p0 + p1;
+            l1 += p2 + p3;
+            p[nt][0] = i8_pack_half2(p0, p1);
+            p[nt][1] = i8_pack_half2(p2, p3);
+        }
+
+        // O += P V: 4 k-steps of 16 keys, 16 n-tiles of 8 dims (two per ldmatrix.x4)
+        if constexpr (acc16) {
+            uint32_t O16[I8_DV / 8][2] = {};
+#pragma unroll
+            for (int kk = 0; kk < I8_BK / 16; kk++) {
+                const uint32_t pa[4] = { p[2 * kk][0], p[2 * kk][1], p[2 * kk + 1][0], p[2 * kk + 1][1] };
+                const int key = kk * 16 + ((lane / 8) % 2) * 8 + lane % 8;
+#pragma unroll
+                for (int np = 0; np < I8_DV / 16; np++) {
+                    const int dim = np * 16 + (lane / 16) * 8;
+                    uint32_t b[4];
+                    i8_ldmatrix_x4_trans(b, sV + key * I8_VSTR + dim * 2);
+                    i8_mma_f16_acc16(O16[2 * np],     pa, b[0], b[1]);
+                    i8_mma_f16_acc16(O16[2 * np + 1], pa, b[2], b[3]);
+                }
+            }
+#pragma unroll
+            for (int nt = 0; nt < I8_DV / 8; nt++) {
+                const float2 lo = __half22float2(*(const half2 *) &O16[nt][0]);
+                const float2 hi = __half22float2(*(const half2 *) &O16[nt][1]);
+                O[nt][0] += lo.x; O[nt][1] += lo.y;
+                O[nt][2] += hi.x; O[nt][3] += hi.y;
+            }
+        } else {
+#pragma unroll
+            for (int kk = 0; kk < I8_BK / 16; kk++) {
+                const uint32_t pa[4] = { p[2 * kk][0], p[2 * kk][1], p[2 * kk + 1][0], p[2 * kk + 1][1] };
+                const int key = kk * 16 + ((lane / 8) % 2) * 8 + lane % 8;
+#pragma unroll
+                for (int np = 0; np < I8_DV / 16; np++) {
+                    const int dim = np * 16 + (lane / 16) * 8;
+                    uint32_t b[4];
+                    i8_ldmatrix_x4_trans(b, sV + key * I8_VSTR + dim * 2);
+                    i8_mma_f16(O[2 * np],     pa, b[0], b[1]);
+                    i8_mma_f16(O[2 * np + 1], pa, b[2], b[3]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    asm volatile("cp.async.wait_group 0;");
+
+    l0 += __shfl_xor_sync(0xFFFFFFFF, l0, 1);
+    l0 += __shfl_xor_sync(0xFFFFFFFF, l0, 2);
+    l1 += __shfl_xor_sync(0xFFFFFFFF, l1, 1);
+    l1 += __shfl_xor_sync(0xFFFFFFFF, l1, 2);
+    const float il0 = l0 > 0.0f ? 1.0f / l0 : 0.0f;
+    const float il1 = l1 > 0.0f ? 1.0f / l1 : 0.0f;
+
+#pragma unroll
+    for (int nt = 0; nt < I8_DV / 8; nt++) {
+        const int d = nt * 8 + 2 * tq;
+        if (r0 < n_q) {
+            float2 * o = (float2 *) ((char *) dst + r0 * nbd2 + h * nbd1 + d * sizeof(float));
+            *o = make_float2(O[nt][0] * il0, O[nt][1] * il0);
+        }
+        if (r1 < n_q) {
+            float2 * o = (float2 *) ((char *) dst + r1 * nbd2 + h * nbd1 + d * sizeof(float));
+            *o = make_float2(O[nt][2] * il1, O[nt][3] * il1);
+        }
+    }
+#else
+    GGML_UNUSED_VARS(Q8, sq_all, K8, sk_all, V, dst, n_q, n_kv, nbv1, nbv2, nbd1, nbd2);
+    NO_DEVICE_CODE;
+#endif // AMPERE_MMA_AVAILABLE
+}
+
+void ggml_cuda_flash_attn_ext_i8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t n_q  = Q->ne[1];
+    const int64_t n_kv = K->ne[1];
+    const int64_t H    = Q->ne[2];
+
+    float scale = 1.0f;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+
+    ggml_cuda_pool_alloc<float>  ksum(ctx.pool(), H * I8_DQK);
+    ggml_cuda_pool_alloc<int8_t> K8(ctx.pool(), H * n_kv * I8_DQK);
+    ggml_cuda_pool_alloc<float>  sk(ctx.pool(), H * n_kv);
+    ggml_cuda_pool_alloc<int8_t> Q8(ctx.pool(), H * n_q * I8_DQK);
+    ggml_cuda_pool_alloc<float>  sq(ctx.pool(), H * n_q);
+
+    CUDA_CHECK(cudaMemsetAsync(ksum.get(), 0, H * I8_DQK * sizeof(float), stream));
+    fattn_i8_k_sum<<<dim3((n_kv + 255) / 256, H), I8_DQK, 0, stream>>>(
+        (const char *) K->data, ksum.get(), n_kv, K->nb[1], K->nb[2]);
+    constexpr int rows_per_block = 8;
+    fattn_i8_quantize<half><<<dim3((n_kv + rows_per_block - 1) / rows_per_block, H), rows_per_block * WARP_SIZE, 0, stream>>>(
+        (const char *) K->data, ksum.get(), K8.get(), sk.get(), n_kv, K->nb[1], K->nb[2], 1.0f, 1.0f / (float) n_kv);
+    // Q * scale * log2(e): the softmax runs on exp2
+    fattn_i8_quantize<float><<<dim3((n_q + rows_per_block - 1) / rows_per_block, H), rows_per_block * WARP_SIZE, 0, stream>>>(
+        (const char *) Q->data, nullptr, Q8.get(), sq.get(), n_q, Q->nb[1], Q->nb[2], scale * 1.4426950408889634f, 0.0f);
+
+    // f16 accumulation of P V when the graph allows it
+    const bool acc16 = ggml_get_op_params_i32(dst, 3) >= GGML_PREC_F16;
+
+    static bool smem_set[GGML_CUDA_MAX_DEVICES] = {};
+    const int device = ggml_cuda_get_device();
+    if (!smem_set[device]) {
+        CUDA_CHECK(cudaFuncSetAttribute(fattn_i8_main<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, I8_SMEM));
+        CUDA_CHECK(cudaFuncSetAttribute(fattn_i8_main<true>,  cudaFuncAttributeMaxDynamicSharedMemorySize, I8_SMEM));
+        smem_set[device] = true;
+    }
+    const dim3 grid((n_q + I8_BQ - 1) / I8_BQ, H);
+    if (acc16) {
+        fattn_i8_main<true><<<grid, I8_WARPS * WARP_SIZE, I8_SMEM, stream>>>(
+            Q8.get(), sq.get(), K8.get(), sk.get(), (const char *) V->data, (float *) dst->data,
+            n_q, n_kv, V->nb[1], V->nb[2], dst->nb[1], dst->nb[2]);
+    } else {
+        fattn_i8_main<false><<<grid, I8_WARPS * WARP_SIZE, I8_SMEM, stream>>>(
+            Q8.get(), sq.get(), K8.get(), sk.get(), (const char *) V->data, (float *) dst->data,
+            n_q, n_kv, V->nb[1], V->nb[2], dst->nb[1], dst->nb[2]);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}

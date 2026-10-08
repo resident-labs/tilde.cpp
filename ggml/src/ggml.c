@@ -3330,6 +3330,17 @@ bool ggml_prec_set_src(
                 ggml_set_op_params_i32(a, 2 + idx, prec_i32);
             }
             break;
+        case GGML_OP_FLASH_ATTN_EXT:
+            {
+                // Q (0) and K (1): e.g. GGML_PREC_Q8 lets the implementation compute Q*K^T in int8
+                if (idx != 0 && idx != 1) {
+                    return false;
+                }
+
+                const int32_t prec_i32 = (int32_t) prec;
+                ggml_set_op_params_i32(a, 5 + idx, prec_i32);
+            }
+            break;
         default:
             return false;
     };

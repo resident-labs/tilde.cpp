@@ -400,12 +400,23 @@ public:
 
 // Tokens per chunk of the per-token blocks (FFN, MoE). The whole request is one ubatch (the MLA layers attend over
 // all of it), so without chunking the MoE intermediates of a 64k request take several GB. Chunks bound them; the
-// results are written into one output tensor in place. 0 disables chunking.
+// results are written into one output tensor in place. At most 8192: the CUDA expert-id helper keeps 4 bytes per
+// token of a MUL_MAT_ID call in shared memory (48 KiB on older GPUs).
 // TILDE_CHUNK_TOKENS overrides the default (tilde-server sets it from the free memory).
 static int64_t tilde_chunk_tokens() {
     static const int64_t value = [] {
         const char * env = std::getenv("TILDE_CHUNK_TOKENS");
-        return env ? std::max<int64_t>(0, std::atoll(env)) : (int64_t) 8192;
+        const int64_t v = env ? std::atoll(env) : 8192;
+        return v <= 0 ? (int64_t) 8192 : std::min<int64_t>(v, 8192);
+    }();
+    return value;
+}
+
+// int8 Q*K^T in the MLA flash attention (TILDE_FA_INT8=0 turns it off)
+static bool tilde_fa_int8() {
+    static const bool value = [] {
+        const char * env = std::getenv("TILDE_FA_INT8");
+        return env == nullptr || std::atoi(env) != 0;
     }();
     return value;
 }
@@ -571,11 +582,11 @@ ggml_tensor * llama_model_tilde::graph::build_layer_kda(ggml_tensor * cur, int i
 
     ggml_tensor * out_gate = ggml_mul_mat(ctx0, layer.ssm_g_a, cur);
     out_gate = ggml_reshape_3d(ctx0, out_gate, head_dim, n_head, n_tokens);
-    out = ggml_reshape_2d(ctx0, ggml_cont(ctx0, out), head_dim, n_head * n_tokens);
+    out = ggml_reshape_2d(ctx0, ggml_is_contiguous(out) ? out : ggml_cont(ctx0, out), head_dim, n_head * n_tokens);
     out = build_norm(out, layer.ssm_o_norm, nullptr, LLM_NORM_RMS, il);
     out = ggml_reshape_3d(ctx0, out, head_dim, n_head, n_tokens);
     out = ggml_mul(ctx0, out, ggml_sigmoid(ctx0, out_gate));
-    cur = ggml_mul_mat(ctx0, layer.wo, ggml_cont_2d(ctx0, out, d_inner, n_tokens));
+    cur = ggml_mul_mat(ctx0, layer.wo, ggml_reshape_2d(ctx0, out, d_inner, n_tokens));
     cb(cur, "kda_out", il);
 
     return cur;
@@ -654,14 +665,35 @@ ggml_tensor * llama_model_tilde::graph::build_layer_mla(ggml_tensor * cur, ggml_
     if (!cparams.flash_attn && n_tokens > 8192) {
         throw std::runtime_error("tilde: requests over 8192 tokens need flash attention (-fa on)");
     }
-    cur = build_attn_mha(q, k, v, nullptr, nullptr, nullptr, nullptr, n_tokens, kq_scale, il);
+    if (cparams.flash_attn) {
+        ggml_tensor * fq = ggml_permute(ctx0, q, 0, 2, 1, 3);
+        ggml_tensor * fk = ggml_cast(ctx0, ggml_permute(ctx0, k, 0, 2, 1, 3), GGML_TYPE_F16);
+        ggml_tensor * fv = ggml_cast(ctx0, ggml_permute(ctx0, v, 0, 2, 1, 3), GGML_TYPE_F16);
+        cur = ggml_flash_attn_ext(ctx0, fq, fk, fv, nullptr, kq_scale, 0.0f, 0.0f);
+        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+        ggml_prec_set_acc(cur, GGML_PREC_F32);
+        if (tilde_fa_int8()) {
+            // Q*K^T may run in int8 (CUDA, Ampere and newer: fattn-i8.cu); other backends ignore the hint.
+            // On CUDA the int8 kernel may also accumulate each 64-key tile of P*V in f16 (then f32 across tiles);
+            // the hint is CUDA-only because other backends would take it as f16 accumulation of the whole attention.
+            ggml_prec_set_src(cur, GGML_PREC_Q8, 0);
+            ggml_prec_set_src(cur, GGML_PREC_Q8, 1);
+            ggml_backend_dev_t dev = model.dev_layer(il);
+            if (dev != nullptr && std::string(ggml_backend_dev_name(dev)).rfind("CUDA", 0) == 0) {
+                ggml_prec_set_acc(cur, GGML_PREC_F16);
+            }
+        }
+        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0] * cur->ne[1], cur->ne[2] * cur->ne[3]);
+    } else {
+        cur = build_attn_mha(q, k, v, nullptr, nullptr, nullptr, nullptr, n_tokens, kq_scale, il);
+    }
     cb(cur, "mla_attn", il);
 
     ggml_tensor * attn_gate = ggml_mul_mat(ctx0, layer.wqkv_gate, attn_input);
     attn_gate = ggml_sigmoid(ctx0, ggml_reshape_3d(ctx0, attn_gate, 1, n_head, n_tokens));
     cur = ggml_reshape_3d(ctx0, cur, v_head_dim, n_head, n_tokens);
     cur = ggml_mul(ctx0, cur, attn_gate);
-    cur = ggml_mul_mat(ctx0, layer.wo, ggml_cont_2d(ctx0, cur, v_head_dim * n_head, n_tokens));
+    cur = ggml_mul_mat(ctx0, layer.wo, ggml_reshape_2d(ctx0, cur, v_head_dim * n_head, n_tokens));
     cb(cur, "mla_out", il);
 
     return cur;

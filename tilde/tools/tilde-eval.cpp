@@ -71,7 +71,10 @@ static std::string node_role(const ggml_tensor * t) {
     const size_t dash = name.rfind('-');
     std::string base = dash == std::string::npos ? name : name.substr(0, dash);
     if (base.empty() || base.rfind("node_", 0) == 0 || base.rfind("leaf_", 0) == 0) {
-        base = std::string("(") + ggml_op_desc(t) + ")";
+        char shape[96];
+        snprintf(shape, sizeof(shape), " [%lld,%lld,%lld] %s<-%s", (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2],
+                 ggml_type_name(t->type), t->src[0] ? ggml_type_name(t->src[0]->type) : "-");
+        base = std::string("(") + ggml_op_desc(t) + ")" + (getenv("TILDE_PROFILE_SHAPES") ? shape : "");
     }
     return base;
 }

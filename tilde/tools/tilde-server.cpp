@@ -162,7 +162,7 @@ int main(int argc, char ** argv) {
         const double left = budget - weights_gib;
         bool fits = false;
         for (int64_t t = n_tokens; t >= 4096 && !fits; t /= 2) {
-            for (const int64_t c : {16384, 8192, 4096, 2048}) {
+            for (const int64_t c : {8192, 4096, 2048}) {
                 const double need = cm.fixed_gib + (cm.per_token_mib * t + cm.per_chunk_mib * std::min(c, t)) / 1024.0;
                 if (need <= left) {
                     n_tokens = t;

@@ -1190,6 +1190,7 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
 // these models pick weights, routing or input meaning per ubatch based on token vs embd input
 bool llm_arch_supports_mixed_batch(const llm_arch & arch) {
     switch (arch) {
+        case LLM_ARCH_TILDE: // token ids only; the mixed-input select copies the whole embd input (n_embd x n_tokens)
         case LLM_ARCH_COGVLM:
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_GRANITE_SWITCH:

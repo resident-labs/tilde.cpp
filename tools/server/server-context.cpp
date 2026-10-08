@@ -5601,7 +5601,7 @@ void server_routes::init_routes() {
         return res;
     };
 
-    this->post_systemone = [this](const server_http_req & req) {
+    auto systemone_impl = [this](const server_http_req & req) {
         const int64_t t_start_us = ggml_time_us();
         auto res = create_response();
         const auto & decision = ctx_server.decision;
@@ -5694,6 +5694,45 @@ void server_routes::init_routes() {
         }
         res->ok(out);
         return res;
+    };
+
+    this->post_systemone = [this, systemone_impl](const server_http_req & req) -> server_http_res_ptr {
+        if (ctx_server.decision.type != COMMON_DECISION_TYPE_TILDE) {
+            return systemone_impl(req);
+        }
+        // tilde: the errors of tilda/serve.py, {"error": "<message>"} with 400 for a bad request
+        auto first = create_response(); // see the note above: the response generator handles the sleeping state
+        auto plain_error = [&first](int status, const std::string & message) {
+            first->status = status;
+            first->data   = safe_json_to_str(json{{"error", message}});
+            return std::move(first);
+        };
+        try {
+            const json body = json::parse(req.body);
+            if (!body.is_object()) {
+                return plain_error(400, "body must be a JSON object");
+            }
+        } catch (const common_json_error &) {
+            return plain_error(400, "body must be JSON");
+        }
+        try {
+            auto res = systemone_impl(req);
+            if (res->status != 200) {
+                // an error result from the task queue: keep the status, flatten the message
+                try {
+                    const json err = json::parse(res->data);
+                    if (err.contains("error") && err.at("error").is_object() && err.at("error").contains("message")) {
+                        return plain_error(res->status, err.at("error").at("message").get<std::string>());
+                    }
+                } catch (const common_json_error &) {
+                }
+            }
+            return res;
+        } catch (const std::invalid_argument & e) {
+            return plain_error(400, e.what());
+        } catch (const common_json_error & e) {
+            return plain_error(400, e.what());
+        }
     };
 
     this->get_lora_adapters = [this](const server_http_req & req) {

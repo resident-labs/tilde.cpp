@@ -139,6 +139,54 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+// dim 0 concat of a contiguous src0 and a transposed src1 (nb[1] is the element size): the causal-conv input of the
+// linear-attention models, concat(conv_state, transpose(x)). src1 is copied through 32x32 shared-memory tiles so
+// both the reads (along ne1 of src1) and the writes (along ne0 of dst) are coalesced.
+template <typename T>
+static __global__ void concat_transposed_src1(const char * __restrict__ src1, char * __restrict__ dst,
+        const int64_t ne00, const int64_t ne10, const int64_t ne11,
+        const uint64_t nb10, const uint64_t nb12, const uint64_t nb13, const int64_t ne12,
+        const uint64_t nb1, const uint64_t nb2, const uint64_t nb3) {
+    __shared__ T tile[32][33];
+    const int64_t i23 = blockIdx.z;
+    const int64_t i2 = i23 % ne12;
+    const int64_t i3 = i23 / ne12;
+    const int64_t i0b = (int64_t) blockIdx.x * 32; // along ne10 (src1 dim 0, strided)
+    const int64_t i1b = (int64_t) blockIdx.y * 32; // along ne11 (src1 dim 1, contiguous)
+    for (int y = threadIdx.y; y < 32; y += blockDim.y) {
+        const int64_t i0 = i0b + y;
+        const int64_t i1 = i1b + threadIdx.x;
+        if (i0 < ne10 && i1 < ne11) {
+            tile[y][threadIdx.x] = *(const T *) (src1 + i3*nb13 + i2*nb12 + i1*sizeof(T) + i0*nb10);
+        }
+    }
+    __syncthreads();
+    for (int y = threadIdx.y; y < 32; y += blockDim.y) {
+        const int64_t i1 = i1b + y;
+        const int64_t i0 = i0b + threadIdx.x;
+        if (i0 < ne10 && i1 < ne11) {
+            *(T *) (dst + i3*nb3 + i2*nb2 + i1*nb1 + (ne00 + i0)*sizeof(T)) = tile[threadIdx.x][y];
+        }
+    }
+}
+
+template <typename T>
+static __global__ void concat_src0_rows(const char * __restrict__ src0, char * __restrict__ dst,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02,
+        const uint64_t nb01, const uint64_t nb02, const uint64_t nb03,
+        const uint64_t nb1, const uint64_t nb2, const uint64_t nb3) {
+    const int64_t i1 = (int64_t) blockIdx.x * blockDim.y + threadIdx.y;
+    const int64_t i23 = blockIdx.y;
+    const int64_t i2 = i23 % ne02;
+    const int64_t i3 = i23 / ne02;
+    if (i1 >= ne01) {
+        return;
+    }
+    for (int64_t i0 = threadIdx.x; i0 < ne00; i0 += blockDim.x) {
+        *(T *) (dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*sizeof(T)) = *(const T *) (src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*sizeof(T));
+    }
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
@@ -154,6 +202,19 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
                     ggml_row_size(src0->type, src0->ne[0])/sizeof(T), src0->ne[1], src0->ne[2],
                     ggml_row_size(dst->type, dst->ne[0])/sizeof(T),  dst->ne[1],  dst->ne[2], dim, stream);
         }
+    } else if (dim == 0 && src0->nb[0] == sizeof(T) && src1->nb[1] == sizeof(T) && src1->nb[0] > sizeof(T) &&
+               dst->nb[0] == sizeof(T) && src0->ne[3] == 1 && src1->ne[3] == 1 &&
+               dst->ne[1] <= 65535*32 && dst->ne[2] <= 65535) {
+        // conv state + transposed input (see concat_transposed_src1)
+        const dim3 block0(32, 8, 1);
+        const dim3 grid0((src0->ne[1] + block0.y - 1) / block0.y, src0->ne[2], 1);
+        concat_src0_rows<T><<<grid0, block0, 0, stream>>>((const char *) src0->data, (char *) dst->data,
+            src0->ne[0], src0->ne[1], src0->ne[2], src0->nb[1], src0->nb[2], src0->nb[3], dst->nb[1], dst->nb[2], dst->nb[3]);
+        const dim3 block1(32, 8, 1);
+        const dim3 grid1((src1->ne[0] + 31) / 32, (src1->ne[1] + 31) / 32, src1->ne[2]);
+        concat_transposed_src1<T><<<grid1, block1, 0, stream>>>((const char *) src1->data, (char *) dst->data,
+            src0->ne[0], src1->ne[0], src1->ne[1], src1->nb[0], src1->nb[2], src1->nb[3], src1->ne[2],
+            dst->nb[1], dst->nb[2], dst->nb[3]);
     } else if (dim == 3 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
         const size_t size0 = ggml_nbytes(src0);
         const size_t size1 = ggml_nbytes(src1);

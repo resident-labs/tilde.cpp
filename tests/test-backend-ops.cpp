@@ -4774,6 +4774,57 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// GGML_OP_CONCAT of a conv state and a transposed input (causal conv of the linear-attention layers)
+struct test_concat_transposed : public test_case {
+    const int64_t n_state, n_channels, n_tokens, n_seqs;
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_state, n_channels, n_tokens, n_seqs);
+    }
+
+    test_concat_transposed(int64_t n_state = 3, int64_t n_channels = 96, int64_t n_tokens = 70, int64_t n_seqs = 1)
+        : n_state(n_state), n_channels(n_channels), n_tokens(n_tokens), n_seqs(n_seqs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * state = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_state, n_channels, n_seqs);
+        ggml_tensor * x     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_channels, n_tokens, n_seqs);
+        return ggml_concat(ctx, state, ggml_transpose(ctx, x), 0);
+    }
+};
+
+// GGML_OP_FLASH_ATTN_EXT with int8 Q and K allowed (CUDA: fattn-i8.cu), decompressed-MLA head sizes, no mask
+struct test_flash_attn_ext_i8 : public test_case {
+    const int64_t nh, n_q, n_kv;
+    const bool acc16;
+
+    std::string vars() override {
+        return VARS_TO_STR4(nh, n_q, n_kv, acc16);
+    }
+
+    double max_nmse_err() override {
+        return 2e-3; // int8 Q and K
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * nh * n_q * n_kv * (192 + 128);
+    }
+
+    test_flash_attn_ext_i8(int64_t nh = 4, int64_t n_q = 200, int64_t n_kv = 200, bool acc16 = false)
+        : nh(nh), n_q(n_q), n_kv(n_kv), acc16(acc16) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 192, n_q,  nh);
+        ggml_tensor * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 192, n_kv, nh);
+        ggml_tensor * v = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_kv, nh);
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f / sqrtf(192.0f), 0.0f, 0.0f);
+        ggml_prec_set_acc(out, acc16 ? GGML_PREC_F16 : GGML_PREC_F32);
+        ggml_prec_set_src(out, GGML_PREC_Q8, 0);
+        ggml_prec_set_src(out, GGML_PREC_Q8, 1);
+        return out;
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
@@ -11568,6 +11619,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true,  true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 16, 4, 2, 1, true,  true));
+    test_cases.emplace_back(new test_concat_transposed(3, 96, 70, 1));
+    test_cases.emplace_back(new test_concat_transposed(3, 2048, 300, 2));
+    test_cases.emplace_back(new test_concat_transposed(1, 33, 65, 1));
+    test_cases.emplace_back(new test_flash_attn_ext_i8(4, 200, 200));
+    test_cases.emplace_back(new test_flash_attn_ext_i8(4, 1000, 777));
+    test_cases.emplace_back(new test_flash_attn_ext_i8(2, 4096, 4096));
+    test_cases.emplace_back(new test_flash_attn_ext_i8(4, 1000, 777, true));
+    test_cases.emplace_back(new test_flash_attn_ext_i8(2, 4096, 4096, true));
     // CUDA chunked prefill kernel (head_size 128, >= 64 tokens): scalar and KDA gates, partial last chunk,
     // several segments of 4096 tokens, v heads > q/k heads, permuted q/k, two sequences
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,   64, 1));
@@ -11648,6 +11707,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // non-causal MLA prefill with decompressed K/V (Tilde: 16 heads, 192/128, no mask)
+    test_cases.emplace_back(new test_flash_attn_ext_i8(16, 32768, 32768));
+    test_cases.emplace_back(new test_flash_attn_ext_i8(16, 32768, 32768, true));
+    test_cases.emplace_back(new test_flash_attn_ext(192, 128, 16, {1, 1}, 32768, 32768, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(192, 128, 16, {1, 1},  4096,  4096, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     // KDA prefill (Ling-3.0 / Tilde shapes)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 32768, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  4096, 1, 1, false, true));
