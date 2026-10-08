@@ -9,6 +9,7 @@
 //   SageAttention2-style attention (TILDE_FA_FAST=1) on a GPU that runs the int8 GEMMs (NVIDIA Ampere or newer, CUDA
 //   build with CUTLASS) and has the memory for 65,536-token requests; otherwise Q8_0, or Q4_KE when memory is short.
 //   The choice and the reason are logged and reported by GET /health. A tag, -m and TILDE_FA_FAST=0 override it;
+//   --tilde-models DIR (or TILDE_MODELS) takes the presets from local files DIR/tilde-8b-a1b-<PRESET>.gguf;
 // - one ubatch that holds the largest request (-c/-b/-ub = the request limit), one slot, flash attention, the model name;
 // - the request limit from the memory left after the weights. Tilde reads the whole request at once (the MLA layers
 //   are bidirectional), so it cannot be split into smaller micro-batches; the compute buffer for the largest request
@@ -160,6 +161,20 @@ int main(int argc, char ** argv) {
     const bool dry_run = has_arg(args, {"--tilde-plan"});
     args.erase(std::remove(args.begin(), args.end(), std::string("--tilde-plan")), args.end());
 
+    // --tilde-models DIR (or TILDE_MODELS): the presets are local files DIR/tilde-8b-a1b-<PRESET>.gguf; the pick is the
+    // same as for the GGUF repo, falling back to the next preset that is on disk
+    std::string models_dir;
+    for (size_t i = 0; i < args.size(); i++) {
+        if (args[i] == "--tilde-models" && i + 1 < args.size()) {
+            models_dir = args[i + 1];
+            args.erase(args.begin() + i, args.begin() + i + 2);
+            break;
+        }
+    }
+    if (models_dir.empty() && getenv("TILDE_MODELS") != nullptr) {
+        models_dir = getenv("TILDE_MODELS");
+    }
+
     // -ngl 0 or --device none: the model runs on the CPU, so plan with host memory
     const std::string ngl_arg = arg_value(args, {"-ngl", "--gpu-layers", "--n-gpu-layers"});
     const std::string dev_arg = arg_value(args, {"-dev", "--device"});
@@ -219,9 +234,34 @@ int main(int argc, char ** argv) {
                                    "is short for Q8_0 at 65,536 tokens: the smaller Q4_KE");
         }
         reason = buf;
+        if (!models_dir.empty()) {
+            // local presets: the pick if its file is there, else Q8_0, else Q4_KE (whichever exists first)
+            auto file = [&](const char * tag) { return models_dir + "/tilde-8b-a1b-" + tag + ".gguf"; };
+            const preset * local = nullptr;
+            for (const preset * c : { pick, &PRESETS[0], &PRESETS[1] }) {
+                if (std::filesystem::exists(file(c->tag))) {
+                    local = c;
+                    break;
+                }
+            }
+            if (local == nullptr) {
+                fprintf(stderr, "tilde-server: no tilde-8b-a1b-{%s,Q8_0,Q4_KE}.gguf in %s\n", pick->tag, models_dir.c_str());
+                return 1;
+            }
+            if (local != pick) {
+                reason += std::string("; ") + pick->tag + " is not in " + models_dir + ", using " + local->tag;
+                pick = local;
+            }
+            for (size_t i = 0; i + 1 < args.size(); i++) {
+                if (args[i] == "-hf" || args[i] == "-hfr" || args[i] == "--hf-repo") {
+                    args[i] = "-m";
+                    args[i + 1] = file(pick->tag);
+                }
+            }
+        }
         chosen = pick->tag;
         weights_mib = pick->weights_mib + pick->extra_mib + host_extra;
-        for (size_t i = 0; i + 1 < args.size(); i++) {
+        for (size_t i = 0; i + 1 < args.size() && models_dir.empty(); i++) {
             if (args[i] == "-hf" || args[i] == "-hfr" || args[i] == "--hf-repo") {
                 args[i + 1] = hf + ":" + chosen;
             }
