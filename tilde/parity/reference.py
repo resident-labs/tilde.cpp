@@ -105,12 +105,18 @@ def cmd_run(args) -> None:
     model, tokenizer, report = joint_serving.load_joint_checkpoint(
         str(args.base), str(args.checkpoint), device="cuda", verify=False, fast_head=True)
     pad = tokenizer.pad_token_id or 0
+    if args.fp32:
+        # numerics floor of the reference itself: the whole model in fp32, no autocast
+        model.float()
+        if getattr(model, "original_output_embedding", None) is not None:
+            model.original_output_embedding.float()
     records = read_records(args.records, args.limit)
     done = set()
     if args.out.exists():
         with open(args.out) as stream:
             done = {json.loads(line)["id"] for line in stream if line.strip()}
-    amp = torch.autocast("cuda", dtype=torch.bfloat16)
+    from contextlib import nullcontext
+    amp = nullcontext() if args.fp32 else torch.autocast("cuda", dtype=torch.bfloat16)
     with open(args.out, "a") as out:
         for index, record in enumerate(records):
             if record["id"] in done:
@@ -241,6 +247,7 @@ def main() -> None:
     p.add_argument("--temperature", type=float, required=True)
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--limit", type=int)
+    p.add_argument("--fp32", action="store_true", help="run the reference in fp32 (no autocast)")
     p = sub.add_parser("compare")
     p.add_argument("--records", type=Path, required=True)
     p.add_argument("--ref", type=Path, required=True)

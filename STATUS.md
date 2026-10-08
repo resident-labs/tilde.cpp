@@ -31,7 +31,19 @@ Phase 2 (model support, CPU parity) is in progress. Phase 1 (fork + converter) i
 
 ## Parity
 
-Not yet measured.
+Reference: the PyTorch t40 checkpoint (`load_joint_checkpoint` + `forward_joint`, batch 1, bf16 autocast, the serving
+computation). Its logits are divided by T = 1.26, and the GGUF has T folded into the head. Inputs are DEV records from
+tilda41_20261006 `dev_orig40_clean.jsonl`, encoded by the trainer's own DEV encoder (`encode_training_records`) and
+selected as a hash-based 1/4 subset. These are private rows; the files live only on hermeslab in `~/tilde-work/data`.
+
+| runtime | records | fields | accuracy (ref -> test) | log loss delta | mean abs dp | p99 abs dp | max abs dp | argmax agreement |
+|---|---:|---:|---|---:|---:|---:|---:|---:|
+| CPU, BF16 GGUF (i7-12700K) | 318 | 405 | .8741 -> .8765 | +0.0002 | .0045 | .039 | .111 | 99.5% |
+| CUDA, BF16 GGUF (3090 Ti) | 5,235 | 7,365 | .8846 -> .8847 | +0.0006 | .0044 | .047 | .268 | 99.62% |
+
+Request encoder (llama-server's tilde type vs `tilda.joint_serving.encode_request`): token-exact and span-exact on all
+3,015 accepted requests (3,000 DEV states plus edge cases). Rejected requests are refused by both encoders with the
+same error texts.
 
 ## Benchmarks
 

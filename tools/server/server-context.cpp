@@ -1229,6 +1229,19 @@ private:
             return false;
         }
 
+        // tilde: the whole request is one ubatch; a smaller ubatch lowers the request limit (rejected, never truncated)
+        if (decision.type == COMMON_DECISION_TYPE_TILDE) {
+            const size_t n_ub = std::min(llama_n_ubatch(ctx_tgt), llama_n_ctx(ctx_tgt));
+            if (decision.max_request_tokens == 0 || decision.max_request_tokens > n_ub) {
+                SRV_WRN("tilde: requests are limited to %zu tokens by the ubatch/context size (the model accepts %zu)\n",
+                        n_ub, decision.max_request_tokens);
+                decision.max_request_tokens = n_ub;
+            }
+            decision.max_question_tokens = std::min(decision.max_question_tokens, decision.max_request_tokens);
+            SRV_INF("tilde: limits %zu tokens per request, %zu per state + question, %zu questions\n",
+                    decision.max_request_tokens, decision.max_question_tokens, decision.max_questions);
+        }
+
         n_ctx = llama_n_ctx(ctx_tgt);
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
@@ -5589,6 +5602,7 @@ void server_routes::init_routes() {
     };
 
     this->post_systemone = [this](const server_http_req & req) {
+        const int64_t t_start_us = ggml_time_us();
         auto res = create_response();
         const auto & decision = ctx_server.decision;
         if (decision.type == COMMON_DECISION_TYPE_NONE) {
@@ -5663,14 +5677,22 @@ void server_routes::init_routes() {
             answers[question.id] = decision.format_answer(question, scores);
         }
 
-        res->ok(json{
+        json out = json{
             {"model",   meta->model_name},
             {"answers", answers},
             {"usage",   {
                 {"input_tokens",  n_tokens},
                 {"output_tokens", 0},
             }},
-        });
+        };
+        if (decision.type == COMMON_DECISION_TYPE_TILDE) {
+            // the response of tilda/serve.py also carries the latency and echoes the request id
+            out["latency_ms"] = std::round((ggml_time_us() - t_start_us) / 100.0) / 10.0;
+            if (body.contains("request_id")) {
+                out["request_id"] = body.at("request_id");
+            }
+        }
+        res->ok(out);
         return res;
     };
 

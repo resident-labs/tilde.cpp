@@ -14,9 +14,12 @@
 
 int main(int argc, char ** argv) {
     std::string model_path;
+    bool no_limits = false;
     for (int i = 1; i < argc; i++) {
         if (std::string(argv[i]) == "-m" && i + 1 < argc) {
             model_path = argv[++i];
+        } else if (std::string(argv[i]) == "--no-limits") {
+            no_limits = true; // benchmarks of the engine beyond the server limits
         }
     }
     if (model_path.empty()) {
@@ -32,6 +35,9 @@ int main(int argc, char ** argv) {
     }
     server_decision_context decision;
     decision.init(model);
+    if (no_limits) {
+        decision.max_questions = decision.max_request_tokens = decision.max_question_tokens = 0;
+    }
 
     std::string line;
     while (std::getline(std::cin, line)) {

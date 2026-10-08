@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 // Tilde: Ling-3.0 backbone (bailingmoe3: KDA linear attention + MLA + MoE) with non-causal MLA layers, and a Clef-style
 // joint decision head. The whole request is one ubatch and no memory module is used: the KDA layers start from zero
@@ -397,6 +398,40 @@ public:
 // backbone
 //
 
+// Tokens per chunk of the per-token blocks (FFN, MoE). The whole request is one ubatch (the MLA layers attend over
+// all of it), so without chunking the MoE intermediates of a 64k request take several GB. Chunks bound them; the
+// results are written into one output tensor in place. 0 disables chunking.
+// TILDE_CHUNK_TOKENS overrides the default (tilde-server sets it from the free memory).
+static int64_t tilde_chunk_tokens() {
+    static const int64_t value = [] {
+        const char * env = std::getenv("TILDE_CHUNK_TOKENS");
+        return env ? std::max<int64_t>(0, std::atoll(env)) : (int64_t) 8192;
+    }();
+    return value;
+}
+
+// y = fn(x) over chunks of the token dimension (dim 1) of x, assembled in order
+template <typename F>
+static ggml_tensor * tilde_chunked(ggml_context * ctx, ggml_tensor * x, int64_t chunk, F && fn) {
+    const int64_t n_tokens = x->ne[1];
+    if (chunk <= 0 || n_tokens <= chunk) {
+        return fn(x);
+    }
+    ggml_tensor * out = nullptr;
+    for (int64_t t0 = 0; t0 < n_tokens; t0 += chunk) {
+        const int64_t n = std::min(chunk, n_tokens - t0);
+        ggml_tensor * xc = ggml_view_2d(ctx, x, x->ne[0], n, x->nb[1], t0 * x->nb[1]);
+        ggml_tensor * yc = fn(xc);
+        GGML_ASSERT(yc->ne[1] == n && ggml_is_contiguous(yc));
+        if (out == nullptr) {
+            out = ggml_pad(ctx, yc, 0, (int) (n_tokens - n), 0, 0);
+        } else {
+            out = ggml_set_2d_inplace(ctx, out, yc, out->nb[1], t0 * out->nb[1]);
+        }
+    }
+    return out;
+}
+
 llama_model_tilde::graph::graph(const llama_model & model_base, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(static_cast<const llama_model_tilde &>(model_base)) {
     GGML_ASSERT(ubatch.n_seqs_unq == 1 && "tilde: one request (sequence) per batch");
@@ -430,12 +465,15 @@ llama_model_tilde::graph::graph(const llama_model & model_base, const llm_graph_
         cb(cur, "ffn_norm", il);
 
         if ((uint32_t) il < hparams.n_layer_dense_lead) {
-            cur = build_ffn(cur,
+            cur = tilde_chunked(ctx0, cur, tilde_chunk_tokens(), [&](ggml_tensor * x) {
+                return build_ffn(x,
                     layer.ffn_up,   nullptr, nullptr,
                     layer.ffn_gate, nullptr, nullptr,
                     layer.ffn_down, nullptr, nullptr,
                     nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+            });
         } else {
+            cur = tilde_chunked(ctx0, cur, tilde_chunk_tokens(), [&](ggml_tensor * cur) {
             ggml_tensor * moe = build_moe_ffn(cur,
                     layer.ffn_gate_inp,
                     layer.ffn_up_exps,
@@ -453,7 +491,8 @@ llama_model_tilde::graph::graph(const llama_model & model_base, const llm_graph_
                     layer.ffn_gate_shexp, nullptr, nullptr,
                     layer.ffn_down_shexp, nullptr, nullptr,
                     nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
-            cur = ggml_add(ctx0, moe, shared);
+            return ggml_add(ctx0, moe, shared);
+            });
         }
         cb(cur, "ffn_out", il);
 
