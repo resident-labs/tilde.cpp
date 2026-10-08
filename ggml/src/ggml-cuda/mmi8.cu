@@ -416,8 +416,10 @@ static __global__ void mmid_i8_swiglu(const half * __restrict__ D, const float d
 // dead once the fused nodes are done)
 static __global__ void mmid_i8_reduce(const half * __restrict__ D, const float dk, const float * __restrict__ sa,
         const float * __restrict__ w_scale, const int32_t * __restrict__ inv, const int32_t * __restrict__ bounds,
-        const int E, const float * __restrict__ weights, float * __restrict__ out, const int N,
-        const int n_used, const int64_t out_nb1) {
+        const int E, const float * __restrict__ weights, float * out, const int N,
+        const int n_used, const int64_t out_nb1, const float * add1, const int64_t add1_nb1,
+        const float * add2, const int64_t add2_nb1) {
+    // add1/add2/out are not __restrict__: out may be add2 (in place residual), each element is read before it is written
     const int64_t t = blockIdx.x;
     const int n = (blockIdx.y * blockDim.x + threadIdx.x) * 4;
     if (n >= N) {
@@ -434,6 +436,15 @@ static __global__ void mmid_i8_reduce(const half * __restrict__ D, const float d
             w = *(const float4 *) (w_scale + (int64_t) e * N + n);
         }
         acc.x += d.x * f * w.x; acc.y += d.y * f * w.y; acc.z += d.z * f * w.z; acc.w += d.w * f * w.w;
+    }
+    // the following ADDs of the graph, in its order: (add1 + moe), then (add2 + that)
+    if (add1 != nullptr) {
+        const float4 a = *(const float4 *) ((const char *) add1 + t * add1_nb1 + n * sizeof(float));
+        acc.x = a.x + acc.x; acc.y = a.y + acc.y; acc.z = a.z + acc.z; acc.w = a.w + acc.w;
+    }
+    if (add2 != nullptr) {
+        const float4 a = *(const float4 *) ((const char *) add2 + t * add2_nb1 + n * sizeof(float));
+        acc.x = a.x + acc.x; acc.y = a.y + acc.y; acc.z = a.z + acc.z; acc.w = a.w + acc.w;
     }
     *(float4 *) ((char *) out + t * out_nb1 + n * sizeof(float)) = acc;
 }
@@ -459,7 +470,8 @@ bool ggml_cuda_mul_mat_id_i8_supported(int device, const ggml_tensor * dst) {
 }
 
 void ggml_cuda_mul_mat_id_i8(ggml_backend_cuda_context & ctx, const ggml_tensor * mmid, const float * w_scale, ggml_tensor * out,
-        mmid_i8_epilogue epilogue, const ggml_tensor * weights, const ggml_cgraph * cgraph, int node_idx) {
+        mmid_i8_epilogue epilogue, const ggml_tensor * weights, const ggml_cgraph * cgraph, int node_idx,
+        const ggml_tensor * add1, const ggml_tensor * add2) {
 #ifdef GGML_CUDA_USE_CUTLASS
     const ggml_tensor * src0 = mmid->src[0];
     const ggml_tensor * src1 = mmid->src[1];
@@ -574,12 +586,14 @@ void ggml_cuda_mul_mat_id_i8(ggml_backend_cuda_context & ctx, const ggml_tensor 
         case MMID_I8_REDUCE: {
             const dim3 grid((unsigned) n_tokens, (N / 4 + threads - 1) / threads);
             mmid_i8_reduce<<<grid, threads, 0, stream>>>((const half *) D.get(), 1.0f / d_scale, sa.get(), w_scale, ids_inv, bounds, E,
-                w_copy.get(), (float *) out->data, N, n_used, out->nb[1]);
+                w_copy.get(), (float *) out->data, N, n_used, out->nb[1],
+                add1 ? (const float *) add1->data : nullptr, add1 ? add1->nb[1] : 0,
+                add2 ? (const float *) add2->data : nullptr, add2 ? add2->nb[1] : 0);
         } break;
     }
     CUDA_CHECK(cudaGetLastError());
 #else
-    GGML_UNUSED_VARS(ctx, mmid, w_scale, out, epilogue, weights, cgraph, node_idx);
+    GGML_UNUSED_VARS(ctx, mmid, w_scale, out, epilogue, weights, cgraph, node_idx, add1, add2);
     GGML_ABORT("the int8 GEMM needs a build with GGML_CUDA_CUTLASS_DIR");
 #endif // GGML_CUDA_USE_CUTLASS
 }

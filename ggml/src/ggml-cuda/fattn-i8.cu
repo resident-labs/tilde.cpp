@@ -66,6 +66,7 @@ bool ggml_cuda_flash_attn_ext_i8_applies(int device, const ggml_tensor * dst) {
 // atomics, so the result is the same on every run)
 static constexpr int I8_KSUM_ROWS = 256;
 
+template <typename T>
 static __global__ void fattn_i8_k_sum_partial(const char * __restrict__ K, float * __restrict__ part,
         const int64_t n_kv, const int64_t nbk1, const int64_t nbk2) {
     const int h = blockIdx.y;
@@ -74,7 +75,8 @@ static __global__ void fattn_i8_k_sum_partial(const char * __restrict__ K, float
     const int64_t t1 = min(t0 + I8_KSUM_ROWS, n_kv);
     float s = 0.0f;
     for (int64_t t = t0; t < t1; t++) {
-        s += __half2float(*(const half *) (K + h * nbk2 + t * nbk1 + d * 2));
+        // through f16 when the source is f32: the same numbers as the f16 copy the graph would have made
+        s += __half2float(ggml_cuda_cast<half>(*(const T *) (K + h * nbk2 + t * nbk1 + d * sizeof(T))));
     }
     part[((int64_t) blockIdx.x * gridDim.y + h) * I8_DQK + d] = s;
 }
@@ -91,7 +93,7 @@ static __global__ void fattn_i8_k_sum_reduce(const float * __restrict__ part, fl
 }
 
 // one row (key or query) per warp: x = (src - mean) * mul, int8 with scale max|x| / 127
-template <typename T>
+template <typename T, bool round_f16>
 static __global__ void fattn_i8_quantize(const char * __restrict__ src, const float * __restrict__ mean,
         int8_t * __restrict__ dst, float * __restrict__ scales, const int64_t n_rows, const int64_t nb1,
         const int64_t nb2, const float mul, const float inv_n_mean) {
@@ -109,6 +111,9 @@ static __global__ void fattn_i8_quantize(const char * __restrict__ src, const fl
     for (int i = 0; i < per_lane; i++) {
         const int d = lane * 2 + (i / 2) * 64 + (i % 2); // pairs: 2 consecutive dims per lane per 64-dim block
         float v = ggml_cuda_cast<float>(((const T *) s)[d]);
+        if (round_f16) {
+            v = __half2float(__float2half(v)); // f32 source of an elided f16 copy: the same numbers as the copy
+        }
         if (mean != nullptr) {
             v -= mean[h * I8_DQK + d] * inv_n_mean;
         }
@@ -435,6 +440,7 @@ static __device__ __forceinline__ int i8v_actual_key(const int L) {
 }
 
 // partial channel maxima of |V| over blocks of 256 keys
+template <typename T>
 static __global__ void fattn_i8v_amax_partial(const char * __restrict__ V, float * __restrict__ part,
         const int64_t n_kv, const int64_t nbv1, const int64_t nbv2) {
     const int h = blockIdx.y;
@@ -443,7 +449,7 @@ static __global__ void fattn_i8v_amax_partial(const char * __restrict__ V, float
     const int64_t t1 = min(t0 + I8_KSUM_ROWS, n_kv);
     float m = 0.0f;
     for (int64_t t = t0; t < t1; t++) {
-        m = fmaxf(m, fabsf(__half2float(*(const half *) (V + h * nbv2 + t * nbv1 + d * 2))));
+        m = fmaxf(m, fabsf(__half2float(ggml_cuda_cast<half>(*(const T *) (V + h * nbv2 + t * nbv1 + d * sizeof(T))))));
     }
     part[((int64_t) blockIdx.x * gridDim.y + h) * I8_DV + d] = m;
 }
@@ -459,6 +465,7 @@ static __global__ void fattn_i8v_amax_reduce(const float * __restrict__ part, fl
 }
 
 // V8[h][d][key'] (key' = permuted key, n_kv padded to a multiple of 64 with zeros): one block per (64 keys, head)
+template <typename T>
 static __global__ void fattn_i8v_quantize(const char * __restrict__ V, const float * __restrict__ sv,
         int8_t * __restrict__ V8, const int64_t n_kv, const int64_t n_kv_pad, const int64_t nbv1, const int64_t nbv2) {
     __shared__ int8_t tile[I8_BK][I8_DV + 4];
@@ -469,7 +476,7 @@ static __global__ void fattn_i8v_quantize(const char * __restrict__ V, const flo
         const int d = i % I8_DV;
         float v = 0.0f;
         if (k0 + k < n_kv) {
-            v = __half2float(*(const half *) (V + h * nbv2 + (k0 + k) * nbv1 + d * 2));
+            v = __half2float(ggml_cuda_cast<half>(*(const T *) (V + h * nbv2 + (k0 + k) * nbv1 + d * sizeof(T))));
         }
         tile[k][d] = (int8_t) __float2int_rn(fminf(127.0f, fmaxf(-127.0f, v / sv[h * I8_DV + d])));
     }
@@ -629,30 +636,39 @@ static __global__ void __launch_bounds__(I8_WARPS * WARP_SIZE, I8_MIN_BLOCKS) fa
                 O[nt][2] *= a1; O[nt][3] *= a1;
             }
         }
-        // P relative to the tile's row maximum: u8 = round(p * 255 / pmax), pmax = exp2(tile max - running max)
-        const float pm0 = exp2f(fmaf(mt0, sq0, -mn0));
-        const float pm1 = exp2f(fmaf(mt1, sq1, -mn1));
-        const float u0  = pm0 > 0.0f ? 255.0f / pm0 : 0.0f;
-        const float u1  = pm1 > 0.0f ? 255.0f / pm1 : 0.0f;
-        float pf[I8_BK / 8][4];
+        // P relative to the tile's row maximum: e = exp2(s - tile max) in [0, 1] (f16x2 exp2: two per instruction), the
+        // u8 code round(255 e) read from the low byte of the f16 255 e + 1024, p = pmax * e with
+        // pmax = exp2(tile max - running max); the row sums add pmax * sum(e)
+        const float tm0 = mt0 == -INFINITY ? 0.0f : mt0 * sq0;
+        const float tm1 = mt1 == -INFINITY ? 0.0f : mt1 * sq1;
+        const float pm0 = exp2f(tm0 - mn0);
+        const float pm1 = exp2f(tm1 - mn1);
+        const half2 k255  = __floats2half2_rn(255.0f, 255.0f);
+        const half2 k1024 = __floats2half2_rn(1024.0f, 1024.0f);
+        uint32_t qb[I8_BK / 8][2]; // per n-tile: row g (2 keys), row g+8 (2 keys) as f16x2 holding 1024 + code
+        half2 el0 = __floats2half2_rn(0.0f, 0.0f), el1 = el0;
 #pragma unroll
         for (int nt = 0; nt < I8_BK / 8; nt++) {
-            pf[nt][0] = exp2f(fmaf(s[nt][0], sq0, -mn0));
-            pf[nt][1] = exp2f(fmaf(s[nt][1], sq0, -mn0));
-            pf[nt][2] = exp2f(fmaf(s[nt][2], sq1, -mn1));
-            pf[nt][3] = exp2f(fmaf(s[nt][3], sq1, -mn1));
-            l0 += pf[nt][0] + pf[nt][1];
-            l1 += pf[nt][2] + pf[nt][3];
+            const half2 e0 = h2exp2(__floats2half2_rn(fmaf(s[nt][0], sq0, -tm0), fmaf(s[nt][1], sq0, -tm0)));
+            const half2 e1 = h2exp2(__floats2half2_rn(fmaf(s[nt][2], sq1, -tm1), fmaf(s[nt][3], sq1, -tm1)));
+            el0 = __hadd2(el0, e0);
+            el1 = __hadd2(el1, e1);
+            const half2 c0 = __hfma2(e0, k255, k1024);
+            const half2 c1 = __hfma2(e1, k255, k1024);
+            qb[nt][0] = *(const uint32_t *) &c0;
+            qb[nt][1] = *(const uint32_t *) &c1;
         }
-        // A fragments for the two k-steps of 32 keys: bytes = keys (2tq, 2tq+1) of n-tile 2j and of n-tile 2j+1
+        l0 += pm0 * (__low2float(el0) + __high2float(el0));
+        l1 += pm1 * (__low2float(el1) + __high2float(el1));
+        // A fragments: bytes = keys (2tq, 2tq+1) of n-tile 2j and of n-tile 2j+1 (low bytes of the f16 codes)
         uint32_t pa[2][4];
 #pragma unroll
         for (int kk = 0; kk < 2; kk++) {
             const int n0 = 4 * kk;
-            pa[kk][0] = i8v_pack_u8(pf[n0][0] * u0, pf[n0][1] * u0, pf[n0 + 1][0] * u0, pf[n0 + 1][1] * u0);
-            pa[kk][1] = i8v_pack_u8(pf[n0][2] * u1, pf[n0][3] * u1, pf[n0 + 1][2] * u1, pf[n0 + 1][3] * u1);
-            pa[kk][2] = i8v_pack_u8(pf[n0 + 2][0] * u0, pf[n0 + 2][1] * u0, pf[n0 + 3][0] * u0, pf[n0 + 3][1] * u0);
-            pa[kk][3] = i8v_pack_u8(pf[n0 + 2][2] * u1, pf[n0 + 2][3] * u1, pf[n0 + 3][2] * u1, pf[n0 + 3][3] * u1);
+            pa[kk][0] = __byte_perm(qb[n0][0],     qb[n0 + 1][0], 0x6420);
+            pa[kk][1] = __byte_perm(qb[n0][1],     qb[n0 + 1][1], 0x6420);
+            pa[kk][2] = __byte_perm(qb[n0 + 2][0], qb[n0 + 3][0], 0x6420);
+            pa[kk][3] = __byte_perm(qb[n0 + 2][1], qb[n0 + 3][1], 0x6420);
         }
         const float f0 = pm0 / 255.0f;
         const float f1 = pm1 / 255.0f;
@@ -728,14 +744,28 @@ void ggml_cuda_flash_attn_ext_i8(ggml_backend_cuda_context & ctx, ggml_tensor * 
     ggml_cuda_pool_alloc<int8_t> Q8(ctx.pool(), H * n_q * I8_DQK);
     ggml_cuda_pool_alloc<float>  sq(ctx.pool(), H * n_q);
 
-    fattn_i8_k_sum_partial<<<dim3(n_part, H), I8_DQK, 0, stream>>>(
-        (const char *) K->data, kpart.get(), n_kv, K->nb[1], K->nb[2]);
-    fattn_i8_k_sum_reduce<<<H, I8_DQK, 0, stream>>>(kpart.get(), ksum.get(), n_part, (int) H);
+    // K (and V) may be f32 -> f16 copies the graph skipped (ggml_cuda_fattn_i8_cast_elidable): read their f32 source
+    const bool k_f32 = ctx.fattn_i8_elided.count(K) != 0;
+    const bool v_f32 = ctx.fattn_i8_elided.count(V) != 0;
+    const ggml_tensor * Ks = k_f32 ? K->src[0] : K;
+    const ggml_tensor * Vs = v_f32 ? V->src[0] : V;
     constexpr int rows_per_block = 8;
-    fattn_i8_quantize<half><<<dim3((n_kv + rows_per_block - 1) / rows_per_block, H), rows_per_block * WARP_SIZE, 0, stream>>>(
-        (const char *) K->data, ksum.get(), K8.get(), sk.get(), n_kv, K->nb[1], K->nb[2], 1.0f, 1.0f / (float) n_kv);
+    const dim3 k_grid((n_kv + rows_per_block - 1) / rows_per_block, H);
+    if (k_f32) {
+        fattn_i8_k_sum_partial<float><<<dim3(n_part, H), I8_DQK, 0, stream>>>(
+            (const char *) Ks->data, kpart.get(), n_kv, Ks->nb[1], Ks->nb[2]);
+        fattn_i8_k_sum_reduce<<<H, I8_DQK, 0, stream>>>(kpart.get(), ksum.get(), n_part, (int) H);
+        fattn_i8_quantize<float, true><<<k_grid, rows_per_block * WARP_SIZE, 0, stream>>>(
+            (const char *) Ks->data, ksum.get(), K8.get(), sk.get(), n_kv, Ks->nb[1], Ks->nb[2], 1.0f, 1.0f / (float) n_kv);
+    } else {
+        fattn_i8_k_sum_partial<half><<<dim3(n_part, H), I8_DQK, 0, stream>>>(
+            (const char *) K->data, kpart.get(), n_kv, K->nb[1], K->nb[2]);
+        fattn_i8_k_sum_reduce<<<H, I8_DQK, 0, stream>>>(kpart.get(), ksum.get(), n_part, (int) H);
+        fattn_i8_quantize<half, false><<<k_grid, rows_per_block * WARP_SIZE, 0, stream>>>(
+            (const char *) K->data, ksum.get(), K8.get(), sk.get(), n_kv, K->nb[1], K->nb[2], 1.0f, 1.0f / (float) n_kv);
+    }
     // Q * scale * log2(e): the softmax runs on exp2
-    fattn_i8_quantize<float><<<dim3((n_q + rows_per_block - 1) / rows_per_block, H), rows_per_block * WARP_SIZE, 0, stream>>>(
+    fattn_i8_quantize<float, false><<<dim3((n_q + rows_per_block - 1) / rows_per_block, H), rows_per_block * WARP_SIZE, 0, stream>>>(
         (const char *) Q->data, nullptr, Q8.get(), sq.get(), n_q, Q->nb[1], Q->nb[2], scale * 1.4426950408889634f, 0.0f);
 
     // int8 P*V when the op allows int8 V (GGML_PREC_Q8 on src 2)
@@ -744,10 +774,19 @@ void ggml_cuda_flash_attn_ext_i8(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ggml_cuda_pool_alloc<float>  vpart(ctx.pool(), (int64_t) n_part * H * I8_DV);
         ggml_cuda_pool_alloc<float>  sv(ctx.pool(), H * I8_DV);
         ggml_cuda_pool_alloc<int8_t> V8(ctx.pool(), H * I8_DV * n_kv_pad);
-        fattn_i8v_amax_partial<<<dim3(n_part, H), I8_DV, 0, stream>>>((const char *) V->data, vpart.get(), n_kv, V->nb[1], V->nb[2]);
+        if (v_f32) {
+            fattn_i8v_amax_partial<float><<<dim3(n_part, H), I8_DV, 0, stream>>>((const char *) Vs->data, vpart.get(), n_kv, Vs->nb[1], Vs->nb[2]);
+        } else {
+            fattn_i8v_amax_partial<half><<<dim3(n_part, H), I8_DV, 0, stream>>>((const char *) V->data, vpart.get(), n_kv, V->nb[1], V->nb[2]);
+        }
         fattn_i8v_amax_reduce<<<H, I8_DV, 0, stream>>>(vpart.get(), sv.get(), n_part, (int) H);
-        fattn_i8v_quantize<<<dim3(n_kv_pad / I8_BK, H), 256, 0, stream>>>((const char *) V->data, sv.get(), V8.get(), n_kv, n_kv_pad,
-            V->nb[1], V->nb[2]);
+        if (v_f32) {
+            fattn_i8v_quantize<float><<<dim3(n_kv_pad / I8_BK, H), 256, 0, stream>>>((const char *) Vs->data, sv.get(), V8.get(), n_kv,
+                n_kv_pad, Vs->nb[1], Vs->nb[2]);
+        } else {
+            fattn_i8v_quantize<half><<<dim3(n_kv_pad / I8_BK, H), 256, 0, stream>>>((const char *) V->data, sv.get(), V8.get(), n_kv,
+                n_kv_pad, V->nb[1], V->nb[2]);
+        }
         static bool smem_v_set[GGML_CUDA_MAX_DEVICES] = {};
         const int dev = ggml_cuda_get_device();
         if (!smem_v_set[dev]) {
@@ -760,6 +799,8 @@ void ggml_cuda_flash_attn_ext_i8(ggml_backend_cuda_context & ctx, ggml_tensor * 
         CUDA_CHECK(cudaGetLastError());
         return;
     }
+
+    GGML_ASSERT(!v_f32); // V is only elided with int8 P*V
 
     // f16 accumulation of P V within each key tile (see the top of the file)
     const char * acc16_env = getenv("GGML_CUDA_FATTN_I8_ACC16");
@@ -785,3 +826,96 @@ void ggml_cuda_flash_attn_ext_i8(ggml_backend_cuda_context & ctx, ggml_tensor * 
     CUDA_CHECK(cudaGetLastError());
 }
 
+
+// which input of an int8-path FLASH_ATTN_EXT the f32 -> f16 copy at node_idx is (1 = K, 2 = V with int8 P*V), when
+// that attention is its only consumer; 0 otherwise
+static int fattn_i8_cast_slot(int device, const ggml_cgraph * cgraph, int node_idx, int * fa_idx) {
+    const ggml_tensor * cpy = cgraph->nodes[node_idx];
+    const ggml_tensor * src = cpy->src[0];
+    if (cpy->op != GGML_OP_CPY || src == nullptr || src->type != GGML_TYPE_F32 || cpy->type != GGML_TYPE_F16 ||
+            (cpy->flags & GGML_TENSOR_FLAG_OUTPUT) || cpy->view_src != nullptr || !ggml_is_contiguous(cpy) ||
+            !ggml_are_same_shape(src, cpy) || src->nb[0] != sizeof(float)) {
+        return 0;
+    }
+    int consumer = -1;
+    int slot = 0;
+    for (int j = node_idx + 1; j < cgraph->n_nodes; j++) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            const ggml_tensor * x = n->src[s];
+            if (x == nullptr || (x != cpy && x->view_src != cpy)) {
+                continue;
+            }
+            if (consumer != -1 || x != cpy || n->op != GGML_OP_FLASH_ATTN_EXT || (s != 1 && s != 2)) {
+                return 0;
+            }
+            consumer = j;
+            slot = s;
+        }
+        if (n->view_src == cpy) {
+            return 0; // a view of the copy (its users are found through view_src above, but keep it simple)
+        }
+    }
+    if (consumer == -1) {
+        return 0;
+    }
+    const ggml_tensor * fa = cgraph->nodes[consumer];
+    if (!ggml_cuda_flash_attn_ext_i8_applies(device, fa) || (slot == 2 && ggml_get_op_params_i32(fa, 7) < GGML_PREC_Q8)) {
+        return 0;
+    }
+    *fa_idx = consumer;
+    return slot;
+}
+
+bool ggml_cuda_fattn_i8_cast_elidable(int device, const ggml_cgraph * cgraph, int node_idx) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(device, cgraph, node_idx);
+    return false;
+#else
+    static const bool disabled = [] {
+        const char * e = getenv("GGML_CUDA_FATTN_I8_NO_CAST_ELIDE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    int fa_idx = -1;
+    if (disabled || fattn_i8_cast_slot(device, cgraph, node_idx, &fa_idx) == 0) {
+        return false;
+    }
+    // the f32 source must still hold its data when the attention runs: no node in between may write into it (its
+    // memory can be reused once the copy, its last reader, has run). Other skipped copies into the same attention
+    // write nothing. The attention itself reads K and V before it writes its output.
+    const ggml_tensor * src = cgraph->nodes[node_idx]->src[0];
+    if (src->data == nullptr) {
+        return false;
+    }
+    const char * lo = (const char *) src->data;
+    const char * hi = lo + ggml_nbytes(src);
+    for (int j = node_idx + 1; j < fa_idx; j++) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_NONE || n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW || n->op == GGML_OP_PERMUTE ||
+                n->op == GGML_OP_TRANSPOSE || n->data == nullptr || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        int other_fa = -1;
+        if (fattn_i8_cast_slot(device, cgraph, j, &other_fa) != 0 && other_fa == fa_idx &&
+                ggml_cuda_fattn_i8_cast_elidable(device, cgraph, j)) {
+            continue;
+        }
+        const char * nlo = (const char *) n->data;
+        const char * nhi = nlo + ggml_nbytes(n);
+        if (nlo < hi && lo < nhi) {
+            return false;
+        }
+    }
+    return true;
+#endif
+}
+
+int ggml_cuda_fattn_i8_cast_consumer(int device, const ggml_cgraph * cgraph, int node_idx) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(device, cgraph, node_idx);
+    return -1;
+#else
+    int fa_idx = -1;
+    return fattn_i8_cast_slot(device, cgraph, node_idx, &fa_idx) != 0 ? fa_idx : -1;
+#endif
+}

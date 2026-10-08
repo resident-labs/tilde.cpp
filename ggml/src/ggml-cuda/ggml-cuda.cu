@@ -26,6 +26,7 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/fattn-i8.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -58,6 +59,7 @@
 #include "ggml-cuda/mean.cuh"
 #include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/topk-moe.cuh"
+#include "ggml-cuda/moe-route.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/wkv.cuh"
@@ -1986,6 +1988,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
+    if (src0->type == GGML_TYPE_I8) {
+        return false; // the int8 grouped GEMM (mmi8.cu) keeps everything on the device
+    }
+
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return true;
     }
@@ -3289,6 +3295,54 @@ static bool ggml_cuda_match_moe_weighted_reduction(
     return true;
 }
 
+// up to max_adds ADD nodes right after the result of a fused I8 MoE reduction (node d, the MUL_MAT_ID at node first)
+// that each add one tensor computed before the MUL_MAT_ID (the shared expert, the residual), so the reduction
+// epilogue can add them: returns their count, the addends in graph order and the last ADD
+static int ggml_cuda_mmid_i8_trailing_adds(const ggml_cgraph * cgraph, int first, int d, int max_adds,
+        const ggml_tensor ** addends, ggml_tensor ** last) {
+    int n = 0;
+    for (int j = d + 1; j < cgraph->n_nodes && n < max_adds; j++) {
+        const ggml_tensor * prev = cgraph->nodes[j - 1];
+        ggml_tensor * a = cgraph->nodes[j];
+        if (a->op != GGML_OP_ADD || a->type != GGML_TYPE_F32 || !ggml_node_has_n_uses(cgraph, j - 1, 1)) {
+            break;
+        }
+        const ggml_tensor * other = a->src[0] == prev ? a->src[1] : (a->src[1] == prev ? a->src[0] : nullptr);
+        if (other == nullptr || other == prev || other->type != GGML_TYPE_F32 || !ggml_are_same_shape(other, prev) ||
+                !ggml_are_same_shape(a, prev) || other->nb[0] != sizeof(float) || a->nb[0] != sizeof(float) ||
+                other->nb[1] % 16 != 0 || a->nb[1] % 16 != 0 || prev->ne[2] != 1 || prev->ne[3] != 1) {
+            break;
+        }
+        bool later = false;
+        for (int k = first; k < j && !later; k++) {
+            later = cgraph->nodes[k] == other || (other->view_src != nullptr && other->view_src == cgraph->nodes[k]);
+        }
+        if (later) {
+            break;
+        }
+        addends[n++] = other;
+        *last = a;
+    }
+    return n;
+}
+
+static bool ggml_cuda_mmid_i8_trailing_adds_ok(const ggml_tensor * const * addends, int n, const ggml_tensor * last) {
+    for (int k = 0; k < n; k++) {
+        if ((uintptr_t) addends[k]->data % 16 != 0) {
+            return false;
+        }
+    }
+    return n == 0 || (uintptr_t) last->data % 16 == 0;
+}
+
+static bool ggml_cuda_mmid_i8_fuse_adds() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_CUDA_MMID_I8_NO_ADD_FUSION");
+        return e == nullptr || atoi(e) == 0;
+    }();
+    return v;
+}
+
 
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
@@ -3584,6 +3638,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (i + 1 < cgraph->n_nodes && ggml_node_has_n_uses(cgraph, i, 1) &&
                 ggml_cuda_match_moe_weighted_reduction(cgraph, i + 1, match) && match.experts == node &&
                 match.expert_scale == nullptr) {
+            const ggml_tensor * addends[2] = {nullptr, nullptr};
+            ggml_tensor * last = match.dst;
+            const int n_add = ggml_cuda_mmid_i8_fuse_adds() ?
+                ggml_cuda_mmid_i8_trailing_adds(cgraph, i, i + match.node_count, 2, addends, &last) : 0;
+            if (n_add > 0 && ggml_cuda_mmid_i8_trailing_adds_ok(addends, n_add, last)) {
+                ggml_cuda_mul_mat_id_i8(*cuda_ctx, node, w_scale, last, MMID_I8_REDUCE, match.weights, cgraph, i,
+                    addends[0], addends[1]);
+                return match.node_count + n_add;
+            }
             ggml_cuda_mul_mat_id_i8(*cuda_ctx, node, w_scale, match.dst, MMID_I8_REDUCE, match.weights, cgraph, i);
             return match.node_count;
         }
@@ -4320,6 +4383,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    if (node->op == GGML_OP_UNARY && ggml_cuda_moe_route_match(cgraph, i)) {
+        ggml_cuda_moe_route(*cuda_ctx, cgraph, i);
+        return ggml_cuda_moe_route_n_nodes() - 1;
+    }
+
+    if (node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes &&
+            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, { i, i + 2 }) &&
+            ggml_cuda_add_rms_norm_mul_fusable(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+        ggml_cuda_op_add_rms_norm_mul_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
         return 4;
@@ -4529,6 +4604,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // f32 -> f16 copies that only feed the int8 attention, which reads the f32 source itself
+                if (node->op == GGML_OP_CPY && ggml_cuda_fattn_i8_cast_elidable(cuda_ctx->device, cgraph, i)) {
+                    cuda_ctx->fattn_i8_elided.insert(node);
+                    continue;
+                }
+                static const bool elide_debug = getenv("GGML_CUDA_ELIDE_DEBUG") != nullptr;
+                if (node->op == GGML_OP_CPY && elide_debug) {
+                    GGML_LOG_INFO("%s: kept CPY %s %s -> %s [%lld,%lld,%lld]\n", __func__, node->name,
+                        ggml_type_name(node->src[0]->type), ggml_type_name(node->type),
+                        (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2]);
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
@@ -4634,6 +4721,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     cuda_ctx->i8_act.data  = nullptr;
     cuda_ctx->i8_ids.graph = nullptr;
     cuda_ctx->i8_ids.ids   = nullptr;
+    cuda_ctx->fattn_i8_elided.clear();
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -4756,6 +4844,24 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 break;
             }
         }
+        // fused MoE routing (moe-route.cu): its outputs must not take the memory of the router logits it reads
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (ggml_cuda_moe_route_maybe(cgraph, i)) {
+                params->add_alloc_dep(params->user_data, ggml_cuda_moe_route_logits(cgraph, i), ggml_cuda_moe_route_last(cgraph, i));
+            }
+        }
+        // f32 -> f16 copies of K and V that the int8 attention skips (fattn-i8.cu): it reads their f32 sources, which
+        // must stay allocated until it runs
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_tensor * cpy = cgraph->nodes[i];
+            if (cpy->op != GGML_OP_CPY) {
+                continue;
+            }
+            const int fa = ggml_cuda_fattn_i8_cast_consumer(cuda_ctx->device, cgraph, i);
+            if (fa >= 0) {
+                params->add_alloc_dep(params->user_data, cpy->src[0], cgraph->nodes[fa]);
+            }
+        }
         // I8 experts: the fused epilogues (mmi8.cu) write the result of the following nodes while the MUL_MAT_ID runs,
         // so its inputs must stay allocated until that result is
         for (int i = 0; i + 1 < cgraph->n_nodes; ++i) {
@@ -4767,6 +4873,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             ggml_cuda_moe_weighted_reduction_match match;
             if (ggml_cuda_match_moe_weighted_reduction(cgraph, i + 1, match) && match.experts == mm) {
                 fused_dst = match.dst;
+                const ggml_tensor * addends[2] = {nullptr, nullptr};
+                if (ggml_cuda_mmid_i8_fuse_adds() && ggml_cuda_mmid_i8_trailing_adds(cgraph, i, i + match.node_count, 2, addends, &fused_dst) > 0) {
+                    for (const ggml_tensor * a : addends) {
+                        if (a != nullptr) {
+                            params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(a), fused_dst);
+                        }
+                    }
+                }
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.weights), fused_dst);
             } else if (i + 3 < cgraph->n_nodes && cgraph->nodes[i + 3]->op == GGML_OP_GLU) {
                 fused_dst = cgraph->nodes[i + 3];

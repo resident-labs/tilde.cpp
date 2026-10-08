@@ -305,12 +305,92 @@ static void group_norm_f32_cuda(
     }
 }
 
+
+// one warp per row with the row in registers (NV float4 per lane, ncols == 128 * NV): x is read once. For the long
+// prefill shapes (rows of 128 and 1536) this is ~2x the block-per-row kernel.
+template <int NV, bool do_multiply, bool do_scale>
+static __global__ void rms_norm_f32_warp_vec(const float * __restrict__ x, float * __restrict__ dst, const int64_t n_rows,
+        const int nrows, const int nchannels, const int64_t stride_row, const int64_t stride_channel,
+        const int64_t stride_sample, const float eps, const float * __restrict__ mul, const float scale_out) {
+    const int64_t r = (int64_t) blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
+    if (r >= n_rows) {
+        return;
+    }
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int64_t row = r % nrows;
+    const int64_t rc  = r / nrows;
+    const int64_t channel = rc % nchannels;
+    const int64_t sample  = rc / nchannels;
+    const float4 * xr = (const float4 *) (x + sample * stride_sample + channel * stride_channel + row * stride_row);
+    float4 v[NV];
+    float s = 0.0f;
+#pragma unroll
+    for (int i = 0; i < NV; i++) {
+        v[i] = xr[i * WARP_SIZE + lane];
+        s += v[i].x * v[i].x + v[i].y * v[i].y + v[i].z * v[i].z + v[i].w * v[i].w;
+    }
+    s = warp_reduce_sum(s);
+    const float scale = rsqrtf(s / (NV * 4 * WARP_SIZE) + eps);
+    float4 * d = (float4 *) (dst + r * (NV * 4 * WARP_SIZE));
+#pragma unroll
+    for (int i = 0; i < NV; i++) {
+        float4 o;
+        if constexpr (do_multiply) {
+            const float4 w = ((const float4 *) mul)[i * WARP_SIZE + lane];
+            o = make_float4(scale * v[i].x * w.x, scale * v[i].y * w.y, scale * v[i].z * w.z, scale * v[i].w * w.w);
+        } else if constexpr (do_scale) {
+            o = make_float4(scale_out * (scale * v[i].x), scale_out * (scale * v[i].y), scale_out * (scale * v[i].z),
+                scale_out * (scale * v[i].w));
+        } else {
+            o = make_float4(scale * v[i].x, scale * v[i].y, scale * v[i].z, scale * v[i].w);
+        }
+        d[i * WARP_SIZE + lane] = o;
+    }
+}
+
+// the warp-per-row kernel when the shapes allow it (rows of 128 * {1,2,3,4,6,8,12,16} 16-byte aligned floats, mul a
+// single aligned row); false otherwise
+template <bool do_multiply, bool do_scale>
+static bool rms_norm_f32_warp_vec_cuda(const float * x, float * dst, const int ncols, const int nrows, const int nchannels,
+        const int nsamples, const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
+        const float eps, const float * mul, const float scale_out, cudaStream_t stream) {
+    static const bool disabled = getenv("GGML_CUDA_RMS_NORM_NO_WARP_VEC") != nullptr;
+    if (disabled || ncols % 128 != 0 || (uintptr_t) x % 16 != 0 || (uintptr_t) dst % 16 != 0 ||
+            stride_row % 4 != 0 || stride_channel % 4 != 0 || stride_sample % 4 != 0 ||
+            (do_multiply && (uintptr_t) mul % 16 != 0)) {
+        return false;
+    }
+    const int64_t n_rows = (int64_t) nrows * nchannels * nsamples;
+    constexpr int rows_per_block = 8;
+    const dim3 grid((unsigned) ((n_rows + rows_per_block - 1) / rows_per_block));
+    const dim3 block(rows_per_block * WARP_SIZE);
+#define RMS_WARP_VEC(NV) \
+    case NV: rms_norm_f32_warp_vec<NV, do_multiply, do_scale><<<grid, block, 0, stream>>>(x, dst, n_rows, nrows, nchannels, \
+        stride_row, stride_channel, stride_sample, eps, mul, scale_out); return true;
+    switch (ncols / 128) {
+        RMS_WARP_VEC(1)
+        RMS_WARP_VEC(2)
+        RMS_WARP_VEC(3)
+        RMS_WARP_VEC(4)
+        RMS_WARP_VEC(6)
+        RMS_WARP_VEC(8)
+        RMS_WARP_VEC(12)
+        RMS_WARP_VEC(16)
+        default: return false;
+    }
+#undef RMS_WARP_VEC
+}
+
 // rows of at most 128 elements (per-head norms) use 128 threads per row instead of 256, so that no thread idles
 template <bool do_scale = false>
 static void rms_norm_f32_cuda(
         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream,
         const float scale_out = 1.0f) {
+    if (rms_norm_f32_warp_vec_cuda<false, do_scale>(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel,
+            stride_sample, eps, nullptr, scale_out, stream)) {
+        return;
+    }
     const dim3 blocks_num(nrows, nchannels, nsamples);
     if (ncols <= 128) {
         const dim3 block_dims(128, 1, 1);
@@ -368,6 +448,11 @@ static void rms_norm_mul_f32_cuda(const float *  x,
     const dim3 blocks_num(nrows, nchannels, nsamples);
     if (mul == nullptr) {
         rms_norm_f32_cuda(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, stream);
+        return;
+    }
+    if (add == nullptr && mul_ncols == (uint32_t) ncols && mul_nrows == 1 && mul_nchannels == 1 && mul_nsamples == 1 &&
+            rms_norm_f32_warp_vec_cuda<true, false>(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel,
+                stride_sample, eps, mul, 1.0f, stream)) {
         return;
     }
     if (add == nullptr) {
@@ -753,4 +838,104 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s03 = nb03 / ts0;
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+// x = a + b (written to sum: the residual stream), dst = rms_norm(x) * w: one warp per row, the row in registers
+template <int NV>
+static __global__ void add_rms_norm_mul_f32_warp_vec(const float * __restrict__ a, const float * __restrict__ b,
+        float * __restrict__ sum, float * __restrict__ dst, const float * __restrict__ w, const int64_t n_rows,
+        const int64_t sa, const int64_t sb, const int64_t ss, const int64_t sd, const float eps) {
+    const int64_t r = (int64_t) blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
+    if (r >= n_rows) {
+        return;
+    }
+    const int lane = threadIdx.x % WARP_SIZE;
+    const float4 * ar = (const float4 *) (a + r * sa);
+    const float4 * br = (const float4 *) (b + r * sb);
+    float4 * sr = (float4 *) (sum + r * ss);
+    float4 v[NV];
+    float s = 0.0f;
+#pragma unroll
+    for (int i = 0; i < NV; i++) {
+        const float4 x = ar[i * WARP_SIZE + lane];
+        const float4 y = br[i * WARP_SIZE + lane];
+        v[i] = make_float4(x.x + y.x, x.y + y.y, x.z + y.z, x.w + y.w);
+        sr[i * WARP_SIZE + lane] = v[i];
+        s += v[i].x * v[i].x + v[i].y * v[i].y + v[i].z * v[i].z + v[i].w * v[i].w;
+    }
+    s = warp_reduce_sum(s);
+    const float scale = rsqrtf(s / (NV * 4 * WARP_SIZE) + eps);
+    float4 * d = (float4 *) (dst + r * sd);
+#pragma unroll
+    for (int i = 0; i < NV; i++) {
+        const float4 g = ((const float4 *) w)[i * WARP_SIZE + lane];
+        d[i * WARP_SIZE + lane] = make_float4(scale * v[i].x * g.x, scale * v[i].y * g.y, scale * v[i].z * g.z, scale * v[i].w * g.w);
+    }
+}
+
+// [ADD, RMS_NORM, MUL] with the ADD result also used elsewhere: same-shape 2D rows of 128 * k floats, a weight vector
+bool ggml_cuda_add_rms_norm_mul_fusable(const ggml_tensor * add, const ggml_tensor * norm, const ggml_tensor * mul) {
+    static const bool disabled = getenv("GGML_CUDA_NO_ADD_RMS_NORM_FUSION") != nullptr;
+    if (disabled || add->op != GGML_OP_ADD || norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL ||
+            norm->src[0] != add || (mul->src[0] != norm && mul->src[1] != norm)) {
+        return false;
+    }
+    const ggml_tensor * w = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+    const ggml_tensor * a = add->src[0];
+    const ggml_tensor * b = add->src[1];
+    auto rows_ok = [&](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F32 && ggml_are_same_shape(t, add) && t->nb[0] == sizeof(float) &&
+            t->nb[1] % 16 == 0 && t->ne[2] == 1 && t->ne[3] == 1 && (uintptr_t) t->data % 16 == 0;
+    };
+    // each warp reads its row of a and b before it writes that row of the outputs: an output may alias an input
+    // only exactly (same address and row stride)
+    auto overlap = [](const ggml_tensor * x, const ggml_tensor * y) {
+        const char * x0 = (const char *) x->data; const char * x1 = x0 + ggml_nbytes(x);
+        const char * y0 = (const char *) y->data; const char * y1 = y0 + ggml_nbytes(y);
+        return x0 < y1 && y0 < x1;
+    };
+    auto alias_ok = [&](const ggml_tensor * out, const ggml_tensor * in) {
+        return !overlap(out, in) || (out->data == in->data && out->nb[1] == in->nb[1]);
+    };
+    if (!alias_ok(add, a) || !alias_ok(add, b) || !alias_ok(mul, a) || !alias_ok(mul, b) || overlap(mul, add) ||
+            overlap(mul, w) || overlap(add, w)) {
+        return false;
+    }
+    const int64_t n = add->ne[0];
+    const int nv = (int) (n / 128);
+    return n % 128 == 0 && (nv == 1 || nv == 2 || nv == 3 || nv == 4 || nv == 6 || nv == 8 || nv == 12 || nv == 16) &&
+        rows_ok(a) && rows_ok(b) && rows_ok(add) && rows_ok(norm) && rows_ok(mul) &&
+        w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && ggml_nelements(w) == n && w->ne[0] == n &&
+        (uintptr_t) w->data % 16 == 0;
+}
+
+void ggml_cuda_op_add_rms_norm_mul_fused(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * norm, ggml_tensor * mul) {
+    const ggml_tensor * w = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+    const ggml_tensor * a = add->src[0];
+    const ggml_tensor * b = add->src[1];
+    float eps;
+    memcpy(&eps, norm->op_params, sizeof(float));
+    const int64_t n_rows = add->ne[1];
+    constexpr int rows_per_block = 8;
+    const dim3 grid((unsigned) ((n_rows + rows_per_block - 1) / rows_per_block));
+    const dim3 block(rows_per_block * WARP_SIZE);
+    cudaStream_t stream = ctx.stream();
+    const int64_t sa = a->nb[1] / sizeof(float), sb = b->nb[1] / sizeof(float);
+    const int64_t ss = add->nb[1] / sizeof(float), sd = mul->nb[1] / sizeof(float);
+#define ADD_RMS_WARP_VEC(NV) \
+    case NV: add_rms_norm_mul_f32_warp_vec<NV><<<grid, block, 0, stream>>>((const float *) a->data, (const float *) b->data, \
+        (float *) add->data, (float *) mul->data, (const float *) w->data, n_rows, sa, sb, ss, sd, eps); break;
+    switch (add->ne[0] / 128) {
+        ADD_RMS_WARP_VEC(1)
+        ADD_RMS_WARP_VEC(2)
+        ADD_RMS_WARP_VEC(3)
+        ADD_RMS_WARP_VEC(4)
+        ADD_RMS_WARP_VEC(6)
+        ADD_RMS_WARP_VEC(8)
+        ADD_RMS_WARP_VEC(12)
+        ADD_RMS_WARP_VEC(16)
+        default: GGML_ABORT("unsupported row length");
+    }
+#undef ADD_RMS_WARP_VEC
+    CUDA_CHECK(cudaGetLastError());
 }

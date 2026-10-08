@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1465,6 +1466,9 @@ struct ggml_backend_cuda_context {
         size_t   s_size = 0;
         std::vector<void *> retired; // outgrown buffers, kept until the context is destroyed (captured CUDA graphs may use them)
     } i8_act;
+
+    // f32 -> f16 copies skipped because only the int8 attention reads them (it reads their f32 source, fattn-i8.cu)
+    std::unordered_set<const ggml_tensor *> fattn_i8_elided;
 
     // int8 experts (mmi8.cu): the expert sort of the last ids tensor, reused by the next MUL_MAT_ID on the same ids
     struct {

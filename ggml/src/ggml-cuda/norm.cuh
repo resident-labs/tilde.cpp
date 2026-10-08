@@ -18,3 +18,7 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
 void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// ADD -> RMS_NORM -> MUL by a weight vector, the ADD result kept (the residual stream), in one pass
+bool ggml_cuda_add_rms_norm_mul_fusable(const ggml_tensor * add, const ggml_tensor * norm, const ggml_tensor * mul);
+void ggml_cuda_op_add_rms_norm_mul_fused(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * norm, ggml_tensor * mul);

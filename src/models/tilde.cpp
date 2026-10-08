@@ -505,6 +505,52 @@ static ggml_tensor * tilde_chunked(ggml_context * ctx, ggml_tensor * x, int64_t 
     return out;
 }
 
+// resid += fn(x), chunk by chunk over the tokens, in place: each chunk's output is added into its rows of resid (no
+// concatenation of the chunks; on CUDA the int8 MoE adds the shared expert and the residual in its reduction). Returns
+// a view of resid that comes after all of its chunks are written.
+template <typename F>
+static ggml_tensor * tilde_residual_chunked(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * resid, ggml_tensor * x,
+        int64_t chunk, F && fn) {
+    const int64_t n_tokens = x->ne[1];
+    // x (the norm of resid) first: ADD, RMS_NORM, MUL stay adjacent in the graph (fused on CUDA)
+    ggml_build_forward_expand(gf, x);
+    if (chunk <= 0 || n_tokens <= chunk) {
+        // the residual view next, so it comes before fn's nodes in the graph order
+        ggml_tensor * r = ggml_view_2d(ctx, resid, resid->ne[0], n_tokens, resid->nb[1], 0);
+        ggml_build_forward_expand(gf, r);
+        ggml_tensor * y = ggml_add_inplace(ctx, r, fn(x));
+        ggml_build_forward_expand(gf, y);
+        return y;
+    }
+    // every in place result needs a consumer, or the graph allocator keeps resid allocated for the rest of the graph
+    // (a view without children never releases its view source): each chunk's rows are a view of the previous
+    // chunk's result, and the returned full view takes the last one as an extra (ordering) source
+    ggml_tensor * prev = nullptr;
+    int64_t prev_t0 = 0;
+    for (int64_t t0 = 0; t0 < n_tokens; t0 += chunk) {
+        const int64_t n = std::min(chunk, n_tokens - t0);
+        ggml_tensor * r = prev == nullptr
+            ? ggml_view_2d(ctx, resid, resid->ne[0], n, resid->nb[1], t0 * resid->nb[1])
+            : ggml_view_2d(ctx, prev,  resid->ne[0], n, resid->nb[1], (t0 - prev_t0) * resid->nb[1]);
+        ggml_tensor * xc = ggml_view_2d(ctx, x, x->ne[0], n, x->nb[1], t0 * x->nb[1]);
+        ggml_build_forward_expand(gf, r);
+        prev = ggml_add_inplace(ctx, r, fn(xc));
+        prev_t0 = t0;
+        ggml_build_forward_expand(gf, prev);
+    }
+    ggml_tensor * out = ggml_view_2d(ctx, resid, resid->ne[0], n_tokens, resid->nb[1], 0);
+    out->src[1] = prev;
+    return out;
+}
+
+static bool tilde_residual_in_place() {
+    static const bool v = [] {
+        const char * e = getenv("TILDE_RESID_INPLACE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return v;
+}
+
 llama_model_tilde::graph::graph(const llama_model & model_base, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(static_cast<const llama_model_tilde &>(model_base)) {
     // one request per batch: a batch with several sequences gets NaN scores (tilde_get_spans), like clef
@@ -537,16 +583,21 @@ llama_model_tilde::graph::graph(const llama_model & model_base, const llm_graph_
         cur = build_norm(ffn_inp, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
-        if ((uint32_t) il < hparams.n_layer_dense_lead) {
-            cur = tilde_chunked(ctx0, cur, tilde_chunk_tokens(), [&](ggml_tensor * x) {
-                return build_ffn(x,
-                    layer.ffn_up,   nullptr, model.row_scale(layer.ffn_up),
-                    layer.ffn_gate, nullptr, model.row_scale(layer.ffn_gate),
-                    layer.ffn_down, nullptr, model.row_scale(layer.ffn_down),
+        auto dense_ffn = [&](ggml_tensor * x) {
+            return build_ffn(x,
+                layer.ffn_up,   nullptr, model.row_scale(layer.ffn_up),
+                layer.ffn_gate, nullptr, model.row_scale(layer.ffn_gate),
+                layer.ffn_down, nullptr, model.row_scale(layer.ffn_down),
+                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+        };
+        auto moe_ffn = [&](ggml_tensor * cur) {
+            // the shared expert first: ADD(shared, moe) then puts the routed experts' reduction right before the ADDs
+            ggml_tensor * shared = build_ffn(cur,
+                    layer.ffn_up_shexp,   nullptr, model.row_scale(layer.ffn_up_shexp),
+                    layer.ffn_gate_shexp, nullptr, model.row_scale(layer.ffn_gate_shexp),
+                    layer.ffn_down_shexp, nullptr, model.row_scale(layer.ffn_down_shexp),
                     nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
-            });
-        } else {
-            cur = tilde_chunked(ctx0, cur, tilde_chunk_tokens(), [&](ggml_tensor * cur) {
+            ggml_build_forward_expand(gf, shared); // build_moe_ffn expands its nodes as it builds them
             ggml_tensor * moe = build_moe_ffn(cur,
                     layer.ffn_gate_inp,
                     layer.ffn_up_exps,
@@ -559,17 +610,19 @@ llama_model_tilde::graph::graph(const llama_model & model_base, const llm_graph_
                     hparams.expert_weights_scale,
                     (llama_expert_gating_func_type) hparams.expert_gating_func,
                     il, nullptr, layer.ffn_gate_up_exps, layer.ffn_up_exps_s, nullptr, layer.ffn_down_exps_s);
-            ggml_tensor * shared = build_ffn(cur,
-                    layer.ffn_up_shexp,   nullptr, model.row_scale(layer.ffn_up_shexp),
-                    layer.ffn_gate_shexp, nullptr, model.row_scale(layer.ffn_gate_shexp),
-                    layer.ffn_down_shexp, nullptr, model.row_scale(layer.ffn_down_shexp),
-                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
-            return ggml_add(ctx0, moe, shared);
-            });
+            return ggml_add(ctx0, shared, moe);
+        };
+        const bool dense = (uint32_t) il < hparams.n_layer_dense_lead;
+        if (tilde_residual_in_place()) {
+            // ffn_inp += ffn(norm(ffn_inp)), chunk by chunk
+            cur = dense ? tilde_residual_chunked(ctx0, gf, ffn_inp, cur, tilde_chunk_tokens(), dense_ffn)
+                        : tilde_residual_chunked(ctx0, gf, ffn_inp, cur, tilde_chunk_tokens(), moe_ffn);
+        } else {
+            cur = dense ? tilde_chunked(ctx0, cur, tilde_chunk_tokens(), dense_ffn)
+                        : tilde_chunked(ctx0, cur, tilde_chunk_tokens(), moe_ffn);
+            cb(cur, "ffn_out", il);
+            cur = ggml_add(ctx0, cur, ffn_inp);
         }
-        cb(cur, "ffn_out", il);
-
-        cur = ggml_add(ctx0, cur, ffn_inp);
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 

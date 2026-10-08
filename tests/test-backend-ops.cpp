@@ -3783,6 +3783,89 @@ struct test_rms_norm_back : public test_case {
 };
 
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
+// grouped sigmoid MoE routing as build_moe_ffn makes it (Ling / Tilde: 128 experts, 8 groups, group top-2 scores,
+// 4 groups kept, top-8, normalized and scaled weights); CUDA runs it as one kernel (moe-route.cu). The ids are checked
+// through rows they select.
+struct test_moe_group_route : public test_case {
+    const int64_t n_tokens;
+    const int64_t k;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_GROUP_ROUTE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_tokens, k);
+    }
+
+    test_moe_group_route(int64_t n_tokens = 70, int64_t k = 8) : n_tokens(n_tokens), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t E = 128, G = 8, T = n_tokens;
+        ggml_tensor * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, T);
+        ggml_tensor * bias   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, E);
+        ggml_tensor * table  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, E, T);
+        ggml_tensor * probs = ggml_sigmoid(ctx, logits);
+        ggml_tensor * sel   = ggml_add(ctx, probs, bias);
+        ggml_tensor * groups = ggml_reshape_3d(ctx, sel, E / G, G, T);
+        ggml_tensor * gs = ggml_argsort_top_k(ctx, groups, 2);
+        gs = ggml_get_rows(ctx, ggml_reshape_4d(ctx, groups, 1, groups->ne[0], groups->ne[1], groups->ne[2]), gs);
+        gs = ggml_sum_rows(ctx, ggml_reshape_3d(ctx, gs, gs->ne[1], gs->ne[2], gs->ne[3]));
+        gs = ggml_reshape_2d(ctx, gs, gs->ne[1], gs->ne[2]);
+        ggml_tensor * top_groups = ggml_argsort_top_k(ctx, gs, 4);
+        ggml_tensor * masked = ggml_get_rows(ctx, groups, top_groups);
+        masked = ggml_set_rows(ctx, ggml_fill(ctx, groups, -INFINITY), masked, top_groups);
+        masked = ggml_reshape_2d(ctx, masked, E, T);
+        ggml_tensor * ids = ggml_argsort_top_k(ctx, masked, k);
+        ggml_tensor * w = ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, E, T), ids);
+        w = ggml_reshape_2d(ctx, w, k, T);
+        ggml_tensor * sum = ggml_clamp(ctx, ggml_sum_rows(ctx, w), 6.103515625e-5, INFINITY);
+        w = ggml_div(ctx, w, sum);
+        w = ggml_reshape_3d(ctx, w, 1, k, T);
+        w = ggml_scale(ctx, w, 2.5f);
+        // the selected experts' rows of a table, summed: depends on every id
+        ggml_tensor * rows = ggml_sum_rows(ctx, ggml_get_rows(ctx, table, ids)); // [1, k, T]
+        return ggml_add(ctx, w, rows);
+    }
+};
+
+// RMS_NORM + MUL by a weight vector (no add), optionally on rows of a wider tensor (strided rows)
+struct test_rms_norm_mul_w : public test_case {
+    const std::array<int64_t, 4> ne;
+    const bool strided;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, strided);
+    }
+
+    test_rms_norm_mul_w(std::array<int64_t, 4> ne = {1536, 70, 1, 1}, bool strided = false) : ne(ne), strided(strided) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0] + (strided ? 128 : 0), ne[1], ne[2], ne[3]);
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_param(a);
+        ggml_set_param(w);
+        ggml_tensor * x = strided ? ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3], a->nb[1], a->nb[2], a->nb[3], 64 * sizeof(float)) : a;
+        // through an ADD first so the norm reads a computed tensor (as in a model)
+        ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+        ggml_set_param(b);
+        x = ggml_add(ctx, x, b);
+        ggml_tensor * y = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        // the ADD result is used again (the residual stream): ADD, RMS_NORM, MUL fuse with two outputs
+        return ggml_add(ctx, y, ggml_scale(ctx, x, 0.5f));
+    }
+};
+
 struct test_rms_norm_mul_add : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -4915,17 +4998,19 @@ struct test_mul_mat_id_i8 : public test_case {
 // (CUDA fuses the SwiGLU and the weighted sum into the grouped int8 GEMMs)
 struct test_moe_i8 : public test_case {
     const int64_t n_mats, n_used, n_embd, n_ff, n_tokens;
+    const bool resid; // + a shared-expert output, then into a residual in place (the Tilde layer's ADDs)
 
     std::string vars() override {
-        return VARS_TO_STR5(n_mats, n_used, n_embd, n_ff, n_tokens);
+        return VARS_TO_STR6(n_mats, n_used, n_embd, n_ff, n_tokens, resid);
     }
 
     double max_nmse_err() override {
         return 5e-4;
     }
 
-    test_moe_i8(int64_t n_mats = 16, int64_t n_used = 4, int64_t n_embd = 256, int64_t n_ff = 128, int64_t n_tokens = 70)
-        : n_mats(n_mats), n_used(n_used), n_embd(n_embd), n_ff(n_ff), n_tokens(n_tokens) {}
+    test_moe_i8(int64_t n_mats = 16, int64_t n_used = 4, int64_t n_embd = 256, int64_t n_ff = 128, int64_t n_tokens = 70,
+            bool resid = false)
+        : n_mats(n_mats), n_used(n_used), n_embd(n_embd), n_ff(n_ff), n_tokens(n_tokens), resid(resid) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * gu   = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, n_embd, 2 * n_ff, n_mats);
@@ -4946,6 +5031,12 @@ struct test_moe_i8 : public test_case {
         for (int64_t i = 0; i < n_used; i++) {
             ggml_tensor * v = ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], i * experts->nb[1]);
             out = out == nullptr ? v : ggml_add(ctx, out, v);
+        }
+        if (resid) {
+            ggml_tensor * shared = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_tensor * r      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens + 3);
+            ggml_tensor * rv     = ggml_view_2d(ctx, r, n_embd, n_tokens, r->nb[1], 2 * r->nb[1]);
+            out = ggml_add_inplace(ctx, rv, ggml_add(ctx, shared, out));
         }
         return out;
     }
@@ -5027,7 +5118,7 @@ struct test_flash_attn_ext_i8 : public test_case {
     const bool acc16;
 
     std::string vars() override {
-        return VARS_TO_STR5(nh, n_q, n_kv, acc16, pv8);
+        return VARS_TO_STR6(nh, n_q, n_kv, acc16, pv8, cast);
     }
 
     double max_nmse_err() override {
@@ -5040,14 +5131,23 @@ struct test_flash_attn_ext_i8 : public test_case {
     }
 
     const bool pv8 = false;
+    const bool cast = false; // K and V as f16 copies of permuted f32 tensors (as the Tilde graph makes them)
 
-    test_flash_attn_ext_i8(int64_t nh = 4, int64_t n_q = 200, int64_t n_kv = 200, bool acc16 = false, bool pv8 = false)
-        : nh(nh), n_q(n_q), n_kv(n_kv), acc16(acc16), pv8(pv8) {}
+    test_flash_attn_ext_i8(int64_t nh = 4, int64_t n_q = 200, int64_t n_kv = 200, bool acc16 = false, bool pv8 = false,
+            bool cast = false)
+        : nh(nh), n_q(n_q), n_kv(n_kv), acc16(acc16), pv8(pv8), cast(cast) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 192, n_q,  nh);
-        ggml_tensor * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 192, n_kv, nh);
-        ggml_tensor * v = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_kv, nh);
+        ggml_tensor * k;
+        ggml_tensor * v;
+        if (cast) {
+            k = ggml_cast(ctx, ggml_permute(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 192, nh, n_kv), 0, 2, 1, 3), GGML_TYPE_F16);
+            v = ggml_cast(ctx, ggml_permute(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, nh, n_kv), 0, 2, 1, 3), GGML_TYPE_F16);
+        } else {
+            k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 192, n_kv, nh);
+            v = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_kv, nh);
+        }
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f / sqrtf(192.0f), 0.0f, 0.0f);
 #ifdef _WIN32
         _putenv_s("GGML_CUDA_FATTN_I8_ACC16", acc16 ? "1" : "0");
@@ -10459,6 +10559,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // in-place tests
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
 
+    // the warp-per-row RMS norm (rows of 128 * k floats)
+    for (int64_t n : { 128, 256, 384, 768, 1536, 2048 }) {
+        test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, false, 1e-6f));
+        test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, true, 1e-6f));
+        test_cases.emplace_back(new test_rms_norm_mul_w({ n, 70, 1, 1 }, false));
+        test_cases.emplace_back(new test_rms_norm_mul_w({ n, 7, 5, 2 }, true));
+    }
+
     for (ggml_type set_rows_type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
         test_cases.emplace_back(new test_rms_norm_mul_rope({ 256, 1, 1, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
         test_cases.emplace_back(new test_rms_norm_mul_rope({ 128, 4, 3, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
@@ -11869,6 +11977,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_i8(4, 200, 200, false, true));
     test_cases.emplace_back(new test_flash_attn_ext_i8(4, 1000, 777, false, true));
     test_cases.emplace_back(new test_flash_attn_ext_i8(2, 4096, 4096, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext_i8(4, 1000, 777, false, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext_i8(4, 1000, 777, true, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext_i8(4, 1000, 777, false, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext_i8(2, 4096, 4096, false, true, true));
     // CUDA chunked prefill kernel (head_size 128, >= 64 tokens): scalar and KDA gates, partial last chunk,
     // several segments of 4096 tokens, v heads > q/k heads, permuted q/k, two sequences
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,   64, 1));
@@ -11881,6 +11993,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 2, 128, 4100, 1));
     test_cases.emplace_back(new test_moe_i8());
     test_cases.emplace_back(new test_moe_i8(128, 8, 1536, 512, 300));
+    test_cases.emplace_back(new test_moe_i8(16, 4, 256, 128, 70, true));
+    test_cases.emplace_back(new test_moe_group_route(70, 8));
+    test_cases.emplace_back(new test_moe_group_route(1000, 8));
+    test_cases.emplace_back(new test_moe_group_route(33, 7));
+    test_cases.emplace_back(new test_moe_group_route(5, 6));
+    test_cases.emplace_back(new test_moe_i8(128, 8, 1536, 512, 300, true));
     test_cases.emplace_back(new test_mul_mat_id_i8());
     test_cases.emplace_back(new test_mul_mat_id_i8(16, 4, 64, 33, 256, 1, false));
     test_cases.emplace_back(new test_mul_mat_id_i8(32, 8, 1024, 300, 1536, 1));
@@ -11974,6 +12092,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext_i8(16, 32768, 32768));
     test_cases.emplace_back(new test_flash_attn_ext_i8(16, 32768, 32768, true));
     test_cases.emplace_back(new test_flash_attn_ext_i8(16, 32768, 32768, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext_i8(16, 32768, 32768, false, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(192, 128, 16, {1, 1}, 32768, 32768, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(192, 128, 16, {1, 1},  4096,  4096, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     // KDA prefill (Ling-3.0 / Tilde shapes)
@@ -12448,6 +12567,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 32768, 1, 1, false, true)); // Tilde KDA 32k
 
     // lightning_indexer
     for (int kv : { 256, 4096, 65536 }) {

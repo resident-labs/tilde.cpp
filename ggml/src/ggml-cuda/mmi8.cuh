@@ -22,7 +22,8 @@ void ggml_cuda_mul_mat_i8(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 bool ggml_cuda_mul_mat_id_i8_supported(int device, const ggml_tensor * dst);
 // what happens to the [N, n_used, T] result: written as is (out = the MUL_MAT_ID node); split into gate and up halves
 // and SwiGLU'd (out = the GLU node, [N/2, n_used, T]); or summed over each token's experts with the router weights
-// [1, n_used, T] (out = [N, T], the MoE output)
+// [1, n_used, T] (out = [N, T], the MoE output; with add1 and add2, out = add2 + (add1 + MoE output): the shared
+// expert and the residual of the next two ADDs of the graph)
 enum mmid_i8_epilogue {
     MMID_I8_SCATTER,
     MMID_I8_SWIGLU,
@@ -30,4 +31,5 @@ enum mmid_i8_epilogue {
 };
 void ggml_cuda_mul_mat_id_i8(ggml_backend_cuda_context & ctx, const ggml_tensor * mmid, const float * w_scale, ggml_tensor * out,
         mmid_i8_epilogue epilogue = MMID_I8_SCATTER, const ggml_tensor * weights = nullptr,
-        const ggml_cgraph * cgraph = nullptr, int node_idx = -1);
+        const ggml_cgraph * cgraph = nullptr, int node_idx = -1, const ggml_tensor * add1 = nullptr,
+        const ggml_tensor * add2 = nullptr);
