@@ -92,14 +92,37 @@ or `-m <file>`.
 | BF16 | `tilde-8b-a1b-BF16.gguf` | bf16 | bf16 | f32 | 16.2 GB | reference |
 
 Every preset is gated against the PyTorch reference on DEV data (see "Parity"). The token embeddings stay in host
-memory, so they cost no VRAM. `tilde-server` picks Q8_0 or Q4_KE by free memory; I8CX is chosen with the tag
-(`-hf resident-labs/tilde-8b-a1b-GGUF:I8CX`) or `-m`.
+memory, so they cost no VRAM. `tilde-server` picks I8CX with the fast attention on NVIDIA Ampere or newer (CUTLASS
+build) with enough memory, else Q8_0, or Q4_KE when memory is short (see "Supported hardware").
 
-Attention options on CUDA (environment of `tilde-server`), measured on 32k requests:
-- default: int8 Q*K^T, f16 P*V;
-- `TILDE_FA_PV8=1`: int8 P*V as well (5% faster);
-- `TILDE_FA_FAST=1`: a SageAttention2-style kernel (int8 Q*K^T with block scales, f16 P*V with f16 accumulation and an
-  overflow guard that reruns the layer in f32; 14% faster than the default, same DEV accuracy).
+Attention on CUDA (Ampere or newer; environment of `tilde-server`), measured on 32k requests:
+- `TILDE_FA_FAST=1`, the default with I8CX: a SageAttention2-style kernel (int8 Q*K^T with block scales, f16 P*V with
+  f16 accumulation and an overflow guard that reruns the layer in f32); 14% faster than the int8 one, same DEV accuracy;
+- `TILDE_FA_FAST=0`: int8 Q*K^T, f16 P*V (the default for the other presets);
+- `TILDE_FA_PV8=1` (with `TILDE_FA_FAST=0`): int8 P*V as well (5% faster than int8 Q*K^T alone).
+
+## Supported hardware
+
+What `tilde-server` picks with no flags, and what was measured (one 32,768-token request through the server, warm;
+STATUS.md has the details). "Not tested" means the code path exists but nobody has run it on that hardware.
+
+| hardware | backend | preset picked | 32k request | memory (peak, 64k limit) |
+|---|---|---|---|---|
+| NVIDIA Ampere, 24 GB (RTX 3090 Ti) | CUDA + CUTLASS | I8CX + fast attention | **1,244 ms** (PyTorch bf16: 2,286 ms) | 13.5 GiB |
+| NVIDIA Ampere or newer, 16 GB | CUDA + CUTLASS | I8CX + fast attention | 1,249 ms (3090 Ti capped to 15.5 GiB) | 13.5 GiB |
+| NVIDIA, 12 GB | CUDA | Q4_KE | 1,997 ms (3090 Ti capped to 11.5 GiB) | 10.2 GiB |
+| NVIDIA, 8 GB | CUDA | Q4_KE, requests up to 19,456 tokens | 32k rejected; 16k: 866 ms (3090 Ti capped to 7.5 GiB) | 6.8 GiB |
+| NVIDIA Ada (RTX 40), Hopper | CUDA + CUTLASS | I8CX + fast attention | not tested | - |
+| NVIDIA Blackwell (RTX 50) | CUDA 12.8+ + CUTLASS | I8CX + fast attention | not tested (RTX 5090 run packaged) | - |
+| NVIDIA Turing / Volta (RTX 20, V100) | CUDA | Q8_0, or Q4_KE when memory is short | not tested | - |
+| NVIDIA, CUDA build without CUTLASS | CUDA | Q8_0 / Q4_KE | 1,994 ms (Q8_0 on the 3090 Ti) | 13.4 GiB |
+| any GPU through Vulkan (measured: RTX 3090 Ti) | Vulkan | Q8_0 / Q4_KE | 3,512 ms (older build) | 13.6 GiB |
+| AMD | ROCm | Q8_0 / Q4_KE | not tested | - |
+| Apple silicon | Metal | Q8_0 / Q4_KE | not tested | - |
+| CPU (measured: i7-12700K, 8 threads) | CPU | Q8_0 | not measured at 32k; 16k: 117 s | 12.1 GiB RSS |
+
+`GET /health` reports the preset, why it was picked, the attention path and the request limit. Override with a preset
+tag (`-hf resident-labs/tilde-8b-a1b-GGUF:Q8_0`), `-m <file>`, or `TILDE_FA_FAST=0` for the standard int8 attention.
 
 ## Build
 

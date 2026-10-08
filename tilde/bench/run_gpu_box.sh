@@ -64,7 +64,13 @@ sys.exit(0 if (major, minor) >= (12, 8) else 1)
 PY
 PIP="python3 -m pip install --quiet --user"
 command -v cmake > /dev/null || { log "installing cmake"; $PIP cmake; export PATH=$HOME/.local/bin:$PATH; }
-command -v hf > /dev/null || { log "installing huggingface_hub"; $PIP -U "huggingface_hub[cli]"; export PATH=$HOME/.local/bin:$PATH; }
+if ! hf version > /dev/null 2>&1; then
+    log "installing huggingface_hub"
+    $PIP -U "huggingface_hub[cli]"
+    export PATH=$HOME/.local/bin:$PATH
+    hf version > /dev/null 2>&1 || die "the hf CLI does not run"
+fi
+log "hf $(hf version 2>/dev/null | tail -1 | tr -d ' ') ($(command -v hf))"
 command -v git > /dev/null || die "no git"
 
 # --- inputs ----------------------------------------------------------------------------------------------------------
@@ -140,6 +146,24 @@ for r in $RUNS; do
     kill $W 2>/dev/null || true
 done
 
+# --- the default path: tilde-server with no flags on the I8CX file (it picks the attention itself) --------------------
+if [[ " $PRESETS " == *" I8CX "* ]]; then
+    log "tilde-server default path (I8CX, no flags): /health and the 1k..64k bodies"
+    PORT=8097
+    $B/tilde-server -m "$S/gguf/tilde-8b-a1b-I8CX.gguf" --port $PORT --tilde-plan > "$RES/server_plan.txt" 2>&1 || true
+    python3 "$WORK/src/tilde/bench/bench_server.py" --cmd "$B/tilde-server -m $S/gguf/tilde-8b-a1b-I8CX.gguf --port $PORT" \
+        --url "http://127.0.0.1:$PORT" --bodies "$S/data/bench_bodies.jsonl" --out "$RES/server.jsonl" --repeat 3 \
+        --label "I8CX default (server)" --log "$RES/server.log" > "$RES/server_bench.log" 2>&1 || log "server benchmark failed (see server_bench.log)"
+    # /health of a server started the same way
+    $B/tilde-server -m "$S/gguf/tilde-8b-a1b-I8CX.gguf" --port $PORT > "$RES/server_health_run.log" 2>&1 &
+    SPID=$!
+    for _ in $(seq 1 120); do
+        curl -s "http://127.0.0.1:$PORT/health" > "$RES/health.json" 2>/dev/null && grep -q '"ok"' "$RES/health.json" && break
+        sleep 2
+    done
+    kill $SPID 2>/dev/null; wait $SPID 2>/dev/null || true
+fi
+
 # --- summary ---------------------------------------------------------------------------------------------------------
 GATE_ARGS=""
 for r in $RUNS; do GATE_ARGS="$GATE_ARGS $RES/par_$r.json:$r"; done
@@ -182,6 +206,24 @@ for r in runs:
         pass
 print("Peak VRAM during the sweep (nvidia-smi, whole GPU): " + ", ".join(peaks))
 PY
+    if [ -f "$RES/server.jsonl" ]; then
+        echo
+        echo "## tilde-server default path (I8CX file, no flags), warm median of 3 (cold), ms"
+        echo
+        echo '```'; cat "$RES/server_plan.txt" 2>/dev/null; echo; cat "$RES/health.json" 2>/dev/null; echo; echo '```'
+        echo
+        RES=$RES python3 - <<'PY'
+import json, os
+rows = [json.loads(l) for l in open(os.environ["RES"] + "/server.jsonl")]
+print("| request | tokens | warm | cold | peak GPU MiB |")
+print("|---|---:|---:|---:|---:|")
+for r in rows:
+    if "warm_ms" in r:
+        print(f"| {r['id']} | {r.get('input_tokens', '-')} | {r['warm_ms']:,.0f} | {r['cold_ms']:,.0f} | {r.get('peak_gpu_server_mib', '-')} |")
+    else:
+        print(f"| {r['id']} | {r.get('input_tokens', '-')} | rejected | | |")
+PY
+    fi
     echo
     echo "## Long requests vs PyTorch (|dp| per question)"
     for r in $RUNS; do

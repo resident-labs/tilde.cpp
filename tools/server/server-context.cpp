@@ -5037,7 +5037,19 @@ void server_routes::init_routes() {
         bool ctx_server; // do NOT delete this line
         GGML_UNUSED(ctx_server);
 
-        res->ok({{"status", "ok"}});
+        json body = {{"status", "ok"}};
+        // tilde-server: the preset it picked and why (tilde/tools/tilde-server.cpp)
+        if (const char * preset = getenv("TILDE_SERVER_PRESET")) {
+            auto env = [](const char * k) { const char * v = getenv(k); return std::string(v ? v : ""); };
+            body["tilde"] = {
+                {"preset", preset},
+                {"reason", env("TILDE_SERVER_PRESET_REASON")},
+                {"attention", env("TILDE_SERVER_ATTENTION")},
+                {"device", env("TILDE_SERVER_DEVICE")},
+                {"max_request_tokens", std::atoll(env("TILDE_SERVER_MAX_TOKENS").c_str())},
+            };
+        }
+        res->ok(body);
         return res;
     };
 

@@ -1,17 +1,21 @@
 // tilde-server: llama-server with the defaults Tilde needs, chosen from the hardware.
 //
-//   tilde-server                                   # resident-labs/tilde-8b-a1b-GGUF, quant picked by free memory
+//   tilde-server                                   # resident-labs/tilde-8b-a1b-GGUF, preset picked from the hardware
 //   tilde-server -hf resident-labs/tilde-8b-a1b-GGUF:Q4_KE
 //   tilde-server -m tilde-8b-a1b-Q8_0.gguf --port 8080
 //
 // Every llama-server option still works and wins over the defaults below. What tilde-server adds:
-// - the model: the GGUF repo when no -m/-hf is given, and the quant preset by free memory when -hf has no tag;
+// - the model: the GGUF repo when no -m/-hf is given, and the preset when -hf has no tag: I8CX with the
+//   SageAttention2-style attention (TILDE_FA_FAST=1) on a GPU that runs the int8 GEMMs (NVIDIA Ampere or newer, CUDA
+//   build with CUTLASS) and has the memory for 65,536-token requests; otherwise Q8_0, or Q4_KE when memory is short.
+//   The choice and the reason are logged and reported by GET /health. A tag, -m and TILDE_FA_FAST=0 override it;
 // - one ubatch that holds the largest request (-c/-b/-ub = the request limit), one slot, flash attention, the model name;
 // - the request limit from the memory left after the weights. Tilde reads the whole request at once (the MLA layers
 //   are bidirectional), so it cannot be split into smaller micro-batches; the compute buffer for the largest request
 //   is reserved at startup, so no request within the limit can run out of memory later. When the memory is too small
 //   for 65,536 tokens, the limit is lowered (and printed); longer requests are rejected with 400, never truncated.
 
+#include "ggml.h"
 #include "ggml-backend.h"
 #include "llama.h"
 
@@ -82,7 +86,30 @@ struct device_info {
     double free_gib  = 0.0;
     double total_gib = 0.0;
     bool   gpu       = false;
+    std::string backend;     // CUDA, Vulkan, Metal, ROCm, CPU, ...
+    bool   int8_gemm = false; // runs I8 MUL_MAT and MUL_MAT_ID (the I8CX preset): NVIDIA Ampere+ with CUTLASS
 };
+
+// whether the device runs the I8CX products: an I8 MUL_MAT and an I8 MUL_MAT_ID with row scales (CUDA: Ampere or
+// newer, built with GGML_CUDA_CUTLASS_DIR; no other backend has them)
+static bool device_runs_i8(ggml_backend_dev_t dev) {
+    ggml_init_params ip = { 16 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    if (ctx == nullptr) {
+        return false;
+    }
+    ggml_tensor * w    = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, 256, 256);
+    ggml_tensor * x    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 512);
+    ggml_tensor * mm   = ggml_mul_mat(ctx, w, x);
+    ggml_tensor * we   = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, 256, 256, 8);
+    ggml_tensor * ws   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 8);
+    ggml_tensor * xe   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 1, 512);
+    ggml_tensor * ids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, 512);
+    ggml_tensor * mmid = ggml_mul_mat_id_scaled(ctx, we, ws, xe, ids);
+    const bool ok = ggml_backend_dev_supports_op(dev, mm) && ggml_backend_dev_supports_op(dev, mmid);
+    ggml_free(ctx);
+    return ok;
+}
 
 static device_info best_device(bool cpu_only) {
     ggml_backend_load_all();
@@ -96,7 +123,8 @@ static device_info best_device(bool cpu_only) {
         size_t free = 0, total = 0;
         ggml_backend_dev_memory(dev, &free, &total);
         if (free / GiB > best.free_gib) {
-            best = { ggml_backend_dev_description(dev), free / GiB, total / GiB, true };
+            best = { ggml_backend_dev_description(dev), free / GiB, total / GiB, true,
+                     ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), device_runs_i8(dev) };
         }
     }
     if (!best.gpu) {
@@ -105,7 +133,7 @@ static device_info best_device(bool cpu_only) {
             if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
                 size_t free = 0, total = 0;
                 ggml_backend_dev_memory(dev, &free, &total);
-                best = { ggml_backend_dev_description(dev), free / GiB, total / GiB, false };
+                best = { ggml_backend_dev_description(dev), free / GiB, total / GiB, false, "CPU", false };
                 break;
             }
         }
@@ -147,10 +175,12 @@ int main(int argc, char ** argv) {
         return std::min<int64_t>(65536, n / 1024 * 1024);
     };
 
-    // model: an explicit -m wins; -hf without a tag gets the largest preset that takes 65,536-token requests, else the
-    // smallest preset (with a lower request limit)
+    // model: an explicit -m wins; -hf without a tag gets I8CX when the device runs its int8 GEMMs and has the memory for
+    // 65,536-token requests, else the largest of Q8_0 / Q4_KE that takes them, else Q4_KE (with a lower request limit)
     double weights_mib = 0.0;
     std::string chosen;
+    std::string reason;
+    char buf[512];
     if (!has_arg(args, {"-m", "--model", "-hf", "-hfr", "--hf-repo", "-mu", "--model-url"})) {
         args.insert(args.begin(), {"-hf", DEFAULT_REPO});
     }
@@ -165,15 +195,30 @@ int main(int argc, char ** argv) {
         weights_mib = m_size / (1024.0 * 1024.0) - (dev.gpu ? HOST_ONLY_MIB : 0.0);
         if (m.find("I8C") != std::string::npos) {
             weights_mib += PRESETS[2].extra_mib; // int8 activation caches of the I8 GEMMs
+            chosen = "I8CX";
         }
+        reason = "given with -m";
     } else if (!hf.empty() && hf.find(':') == std::string::npos) {
+        const preset & i8cx = PRESETS[2];
         const preset * pick = &PRESETS[1];
-        for (const auto & p : PRESETS) {
-            if (p.auto_pick && max_tokens(p.weights_mib + p.extra_mib + host_extra) >= 65536) {
-                pick = &p;
-                break;
+        if (dev.int8_gemm && max_tokens(i8cx.weights_mib + i8cx.extra_mib + host_extra) >= 65536) {
+            pick = &i8cx;
+            snprintf(buf, sizeof(buf), "%s device runs the int8 GEMMs (Ampere or newer, CUTLASS build) and %.1f GiB free holds "
+                     "I8CX for 65,536-token requests", dev.backend.c_str(), dev.free_gib);
+        } else {
+            for (const auto & p : PRESETS) {
+                if (p.auto_pick && max_tokens(p.weights_mib + p.extra_mib + host_extra) >= 65536) {
+                    pick = &p;
+                    break;
+                }
             }
+            snprintf(buf, sizeof(buf), "%s %s; %.1f GiB free %s", dev.backend.c_str(),
+                     !dev.gpu ? "(no GPU)" : dev.int8_gemm ? "runs the int8 GEMMs but has too little memory for I8CX at 65,536 tokens"
+                                                           : "does not run the I8CX int8 GEMMs (needs NVIDIA Ampere or newer and a CUTLASS build)",
+                     dev.free_gib, pick == &PRESETS[0] ? "holds Q8_0 for 65,536-token requests" :
+                                   "is short for Q8_0 at 65,536 tokens: the smaller Q4_KE");
         }
+        reason = buf;
         chosen = pick->tag;
         weights_mib = pick->weights_mib + pick->extra_mib + host_extra;
         for (size_t i = 0; i + 1 < args.size(); i++) {
@@ -191,6 +236,23 @@ int main(int argc, char ** argv) {
                 chosen = p.tag;
             }
         }
+        reason = "given with a preset tag";
+    }
+
+    // I8CX runs the SageAttention2-style attention unless TILDE_FA_FAST is set (TILDE_FA_FAST=0 keeps the int8 Q*K^T
+    // with f16 P*V)
+    std::string attention = "default (int8 Q*K^T where supported)";
+    if (chosen == "I8CX" && dev.int8_gemm) {
+        setenv("TILDE_FA_FAST", "1", /*overwrite =*/ 0);
+    }
+    if (const char * f = getenv("TILDE_FA_FAST"); f != nullptr && atoi(f) != 0 && dev.int8_gemm) {
+        attention = "fast (SageAttention2-style: int8 Q*K^T, f16 P*V)";
+    } else if (const char * p8 = getenv("TILDE_FA_PV8"); p8 != nullptr && atoi(p8) != 0 && dev.int8_gemm) {
+        attention = "int8 Q*K^T and P*V";
+    }
+    if (chosen == "I8CX" && !dev.int8_gemm) {
+        fprintf(stderr, "tilde-server: warning: I8CX needs NVIDIA Ampere or newer and a CUDA build with CUTLASS; %s cannot "
+                "run its int8 GEMMs\n", dev.name.c_str());
     }
 
     int64_t n_tokens = max_tokens(weights_mib);
@@ -225,9 +287,17 @@ int main(int argc, char ** argv) {
                 (long long) n_tokens, dev.free_gib, dev.name.c_str());
     }
 
-    fprintf(stderr, "tilde-server: device %s (%s, %.1f of %.1f GiB free), preset %s (%.1f GiB), max request %lld "
-            "tokens\n", dev.name.c_str(), dev.gpu ? "GPU" : "CPU", dev.free_gib, dev.total_gib,
-            chosen.empty() ? "(given)" : chosen.c_str(), weights_mib / 1024.0, (long long) n_tokens);
+    fprintf(stderr, "tilde-server: device %s (%s, %s, %.1f of %.1f GiB free), preset %s (%.1f GiB), attention %s, max "
+            "request %lld tokens\n", dev.name.c_str(), dev.gpu ? "GPU" : "CPU", dev.backend.c_str(), dev.free_gib,
+            dev.total_gib, chosen.empty() ? "(given)" : chosen.c_str(), weights_mib / 1024.0, attention.c_str(),
+            (long long) n_tokens);
+    fprintf(stderr, "tilde-server: preset %s: %s\n", chosen.empty() ? "(given)" : chosen.c_str(), reason.c_str());
+    // reported by GET /health
+    setenv("TILDE_SERVER_PRESET", chosen.empty() ? "(given)" : chosen.c_str(), 1);
+    setenv("TILDE_SERVER_PRESET_REASON", reason.c_str(), 1);
+    setenv("TILDE_SERVER_ATTENTION", attention.c_str(), 1);
+    setenv("TILDE_SERVER_DEVICE", (dev.name + " (" + dev.backend + ")").c_str(), 1);
+    setenv("TILDE_SERVER_MAX_TOKENS", std::to_string(n_tokens).c_str(), 1);
 
     if (dry_run) {
         fprintf(stderr, "tilde-server: llama-server");
