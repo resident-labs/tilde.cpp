@@ -254,6 +254,11 @@ if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
     add_subdirectory(tools)
 endif()
 
+# tilde.cpp: Tilde-specific tools (parity and benchmark harness)
+if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tilde/CMakeLists.txt)
+    add_subdirectory(tilde)
+endif()
+
 if (LLAMA_BUILD_APP)
     add_subdirectory(app)
 endif()
