@@ -119,6 +119,7 @@ class TildeModel(BailingMoeV3Model):
     ckpt_dir: Path
     report: dict
     temperature: float
+    merge_gate_up: bool = True
     marker_start: int
     head_type: gguf.GGMLQuantizationType = gguf.GGMLQuantizationType.F32
     lexical_type: gguf.GGMLQuantizationType = gguf.GGMLQuantizationType.BF16
@@ -193,7 +194,10 @@ class TildeModel(BailingMoeV3Model):
             # layers.N.mlp.w_gu [E, 2I, H] / layers.N.mlp.w_down [E, H, I]
             layer = int(key.split(".")[1])
             prefix = f"model.layers.{layer}.mlp.experts."
-            if key.endswith(".w_gu"):
+            if key.endswith(".w_gu") and type(self).merge_gate_up:
+                # gate rows then up rows: llama.cpp's merged ffn_gate_up_exps layout
+                tensors[prefix + "gate_up_proj.weight"] = (lambda key=key: experts[key])
+            elif key.endswith(".w_gu"):
                 tensors[prefix + "gate_proj.weight"] = (lambda key=key: experts[key][:, :inter, :])
                 tensors[prefix + "up_proj.weight"] = (lambda key=key: experts[key][:, inter:, :])
             elif key.endswith(".w_down"):
@@ -213,6 +217,9 @@ class TildeModel(BailingMoeV3Model):
     def modify_tensors(self, data_torch, name: str, bid: int | None):
         if name.startswith("joint_head."):
             yield from self._modify_head(data_torch, name)
+            return
+        if name.endswith(".mlp.experts.gate_up_proj.weight"):
+            yield self.format_tensor_name(gguf.MODEL_TENSOR.FFN_GATE_UP_EXP, bid), data_torch
             return
         if ".mlp.experts." in name:
             # already stacked [E, ...]: skip BailingMoeV3Model's per-expert buffering
@@ -365,6 +372,8 @@ def main() -> None:
     ap.add_argument("--lexical-type", choices=("bf16", "f16", "f32", "q8_0"), default="bf16",
                     help="type of the frozen output table the head reads option-token vectors from")
     ap.add_argument("--model-name", default="tilde-8b-a1b")
+    ap.add_argument("--split-gate-up", action="store_true",
+                    help="write the routed experts' gate and up as two tensors (default: one merged ffn_gate_up_exps)")
     ap.add_argument("--no-verify", action="store_true", help="skip the sha256 checks of the checkpoint files")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--verbose", action="store_true")
@@ -411,6 +420,7 @@ def main() -> None:
         TildeModel.ckpt_dir = args.checkpoint
         TildeModel.report = report
         TildeModel.temperature = args.temperature
+        TildeModel.merge_gate_up = not args.split_gate_up
         TildeModel.marker_start = int(report["marker_start"])
         TildeModel.head_type = types[args.head_type]
         TildeModel.lexical_type = types[args.lexical_type]

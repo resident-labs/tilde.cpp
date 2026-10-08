@@ -94,8 +94,12 @@ void llama_model_tilde::load_arch_tensors(llama_model_loader & ml) {
         } else {
             layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", il), { n_embd, n_expert }, 0);
             layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   il), { n_expert }, 0);
-            layer.ffn_gate_exps   = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS,   "weight", il), { n_embd, hparams.n_ff_exp(), n_expert }, 0);
-            layer.ffn_up_exps     = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,     "weight", il), { n_embd, hparams.n_ff_exp(), n_expert }, 0);
+            // gate and up of the routed experts: one merged tensor (one expert matmul for both), or two
+            layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", il), { n_embd, 2 * hparams.n_ff_exp(), n_expert }, TENSOR_NOT_REQUIRED);
+            if (layer.ffn_gate_up_exps == nullptr) {
+                layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", il), { n_embd, hparams.n_ff_exp(), n_expert }, 0);
+                layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", il), { n_embd, hparams.n_ff_exp(), n_expert }, 0);
+            }
             layer.ffn_down_exps   = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,   "weight", il), { hparams.n_ff_exp(), n_embd, n_expert }, 0);
             layer.ffn_gate_shexp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,  "weight", il), { n_embd, hparams.n_ff_shexp }, 0);
             layer.ffn_up_shexp    = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,    "weight", il), { n_embd, hparams.n_ff_shexp }, 0);
@@ -498,7 +502,7 @@ llama_model_tilde::graph::graph(const llama_model & model_base, const llm_graph_
                     hparams.expert_weights_norm,
                     hparams.expert_weights_scale,
                     (llama_expert_gating_func_type) hparams.expert_gating_func,
-                    il);
+                    il, nullptr, layer.ffn_gate_up_exps);
             ggml_tensor * shared = build_ffn(cur,
                     layer.ffn_up_shexp,   nullptr, nullptr,
                     layer.ffn_gate_shexp, nullptr, nullptr,

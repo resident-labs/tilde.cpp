@@ -101,6 +101,30 @@ static __global__ void k_get_rows_float(
     }
 }
 
+// rows of a few elements (e.g. the expert weights of a MoE router, one float per row): one thread per element instead
+// of one block per row
+template<typename src0_t, typename dst_t>
+static __global__ void k_get_rows_float_small(
+        const src0_t * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
+        const int64_t ne00, const int64_t ne10, const int64_t ne11, const int64_t n,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+    const int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    const int64_t i00 = idx % ne00;
+    int64_t       r   = idx / ne00;
+    const int64_t i10 = r % ne10;
+    r /= ne10;
+    const int64_t i11 = r % ne11;
+    const int64_t i12 = r / ne11;
+    const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+    const src0_t * src0_row = (const src0_t *)((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03);
+    dst[i10*s1 + i11*s2 + i12*s3 + i00] = ggml_cuda_cast<dst_t>(src0_row[i00]);
+}
+
 template<typename dst_t>
 static __global__ void k_get_rows_float_vec(
         const dst_t * src0_ptr, const int32_t * src1_ptr, dst_t * dst_ptr,
@@ -253,6 +277,13 @@ static void get_rows_cuda_float(
     GGML_ASSERT(ne12 > 0);
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
+
+    if (ne00 < 32) {
+        const int64_t n = ne00*ne10*ne11*ne12;
+        k_get_rows_float_small<<<(n + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE, CUDA_GET_ROWS_BLOCK_SIZE, 0, stream>>>(
+            src0_d, src1_d, dst_d, ne00, ne10, ne11, n, s1, s2, s3, nb01, nb02, nb03, s10, s11, s12);
+        return;
+    }
 
     if constexpr (std::is_same<src0_t, dst_t>::value) {
         constexpr int VEC = 16 / sizeof(dst_t);

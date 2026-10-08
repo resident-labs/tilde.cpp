@@ -22,10 +22,10 @@ common=(--token-embedding-type bf16 --output-tensor-type bf16
 for preset in "$@"; do
     case $preset in
         Q8_0)   extra=() ;;
-        Q6_KE)  extra=(--tensor-type 'ffn_(gate|up|down)_exps=q6_K') ;;
-        Q4_KE)  extra=(--tensor-type 'ffn_(gate|up|down)_exps=q4_K') ;;
-        MXFP4E) extra=(--tensor-type 'ffn_(gate|up|down)_exps=mxfp4') ;;
-        NVFP4E) extra=(--tensor-type 'ffn_(gate|up|down)_exps=nvfp4') ;;
+        Q6_KE)  extra=(--tensor-type 'ffn_(gate_up|gate|up|down)_exps=q6_K') ;;
+        Q4_KE)  extra=(--tensor-type 'ffn_(gate_up|gate|up|down)_exps=q4_K') ;;
+        MXFP4E) extra=(--tensor-type 'ffn_(gate_up|gate|up|down)_exps=mxfp4') ;;
+        NVFP4E) extra=(--tensor-type 'ffn_(gate_up|gate|up|down)_exps=nvfp4') ;;
         *) echo "unknown preset $preset" >&2; exit 1 ;;
     esac
     "$BIN/llama-quantize" "${common[@]}" "${extra[@]}" "$IN" "$OUT/tilde-8b-a1b-$preset.gguf" Q8_0 8
