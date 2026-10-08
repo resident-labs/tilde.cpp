@@ -158,7 +158,8 @@ if [[ " $PRESETS " == *" I8CX "* ]]; then
     $B/tilde-server -m "$S/gguf/tilde-8b-a1b-I8CX.gguf" --port $PORT > "$RES/server_health_run.log" 2>&1 &
     SPID=$!
     for _ in $(seq 1 120); do
-        curl -s "http://127.0.0.1:$PORT/health" > "$RES/health.json" 2>/dev/null && grep -q '"ok"' "$RES/health.json" && break
+        python3 -c "import urllib.request,sys; sys.stdout.write(urllib.request.urlopen('http://127.0.0.1:$PORT/health', timeout=5).read().decode())" \
+            > "$RES/health.json" 2>/dev/null && grep -q '"ok"' "$RES/health.json" && break
         sleep 2
     done
     kill $SPID 2>/dev/null; wait $SPID 2>/dev/null || true
