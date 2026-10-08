@@ -1452,7 +1452,12 @@ struct ggml_backend_cuda_context {
     // read the same tensor before anything overwrites it (e.g. the q/k/v/gate projections of one input)
     struct {
         const ggml_cgraph * graph = nullptr;
-        const ggml_tensor * src   = nullptr;
+        const void *  data   = nullptr; // the activations: data, row size, rows (and their layout)
+        int64_t       K      = 0;
+        int64_t       n_rows = 0;
+        int64_t       nb1    = 0;
+        int64_t       nb2    = 0;
+        int64_t       ne1    = 0;
         int     valid_until = -1;
         int8_t * q      = nullptr;
         float  * s      = nullptr;
@@ -1460,6 +1465,17 @@ struct ggml_backend_cuda_context {
         size_t   s_size = 0;
         std::vector<void *> retired; // outgrown buffers, kept until the context is destroyed (captured CUDA graphs may use them)
     } i8_act;
+
+    // int8 experts (mmi8.cu): the expert sort of the last ids tensor, reused by the next MUL_MAT_ID on the same ids
+    struct {
+        const ggml_cgraph * graph = nullptr;
+        const void * ids = nullptr;
+        int64_t n_used = 0, n_tokens = 0, n_expert = 0, nb1 = 0;
+        int     valid_until = -1;
+        int32_t * fwd = nullptr, * inv = nullptr, * bounds = nullptr;
+        size_t    size = 0, bounds_size = 0;
+        std::vector<void *> retired;
+    } i8_ids;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};

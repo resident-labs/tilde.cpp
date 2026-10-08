@@ -699,11 +699,17 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
-    if (i8_act.q != nullptr || i8_act.s != nullptr || !i8_act.retired.empty()) {
+    if (i8_act.q != nullptr || i8_act.s != nullptr || !i8_act.retired.empty() || i8_ids.fwd != nullptr || !i8_ids.retired.empty()) {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(i8_act.q));
         CUDA_CHECK(cudaFree(i8_act.s));
         for (void * p : i8_act.retired) {
+            CUDA_CHECK(cudaFree(p));
+        }
+        CUDA_CHECK(cudaFree(i8_ids.fwd));
+        CUDA_CHECK(cudaFree(i8_ids.inv));
+        CUDA_CHECK(cudaFree(i8_ids.bounds));
+        for (void * p : i8_ids.retired) {
             CUDA_CHECK(cudaFree(p));
         }
     }
@@ -3578,7 +3584,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (i + 1 < cgraph->n_nodes && ggml_node_has_n_uses(cgraph, i, 1) &&
                 ggml_cuda_match_moe_weighted_reduction(cgraph, i + 1, match) && match.experts == node &&
                 match.expert_scale == nullptr) {
-            ggml_cuda_mul_mat_id_i8(*cuda_ctx, node, w_scale, match.dst, MMID_I8_REDUCE, match.weights);
+            ggml_cuda_mul_mat_id_i8(*cuda_ctx, node, w_scale, match.dst, MMID_I8_REDUCE, match.weights, cgraph, i);
             return match.node_count;
         }
         if (i + 3 < cgraph->n_nodes && ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_GLU }, { i + 3 })) {
@@ -3593,7 +3599,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU && ggml_get_op_params_i32(glu, 1) == 0 &&
                     glu->src[0] == g && glu->src[1] == u && is_half(g, 0) && is_half(u, half * sizeof(float)) &&
                     glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) && half % 4 == 0) {
-                ggml_cuda_mul_mat_id_i8(*cuda_ctx, node, w_scale, glu, MMID_I8_SWIGLU);
+                ggml_cuda_mul_mat_id_i8(*cuda_ctx, node, w_scale, glu, MMID_I8_SWIGLU, nullptr, cgraph, i);
                 return 3;
             }
         }
@@ -4625,7 +4631,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     // the int8 activations kept by mmi8.cu belong to the previous graph evaluation
     cuda_ctx->i8_act.graph = nullptr;
-    cuda_ctx->i8_act.src   = nullptr;
+    cuda_ctx->i8_act.data  = nullptr;
+    cuda_ctx->i8_ids.graph = nullptr;
+    cuda_ctx->i8_ids.ids   = nullptr;
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

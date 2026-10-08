@@ -80,6 +80,54 @@ static int mmi8_valid_until(const ggml_cgraph * cgraph, int node_idx, const ggml
     return last;
 }
 
+// per-token int8 copy of the rows of src1 ([K, ne1, ne2], rows (i1, i2)), kept in the context and reused by the next
+// I8 product that reads the same data before a later node of the graph writes to it
+static void mmi8_token_q8(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const ggml_cgraph * cgraph,
+        const int node_idx, int8_t * & q, float * & s) {
+    const int64_t K = src1->ne[0];
+    const int64_t T = src1->ne[1] * src1->ne[2];
+    cudaStream_t stream = ctx.stream();
+    auto & cache = ctx.i8_act;
+    const bool hit = cgraph != nullptr && cache.graph == cgraph && cache.data == src1->data && cache.K == K &&
+        cache.n_rows == T && cache.nb1 == (int64_t) src1->nb[1] && cache.nb2 == (int64_t) src1->nb[2] &&
+        cache.ne1 == src1->ne[1] && node_idx <= cache.valid_until;
+    if (!hit) {
+        if ((size_t) (T * K) > cache.q_size || (size_t) T > cache.s_size) {
+            // grow (never during a CUDA graph capture: the first evaluation of a new graph shape is not captured);
+            // the old buffers stay allocated because a captured graph may still refer to them
+            if (cache.q != nullptr) {
+                cache.retired.push_back(cache.q);
+                cache.retired.push_back(cache.s);
+            }
+            cache.q_size = std::max((size_t) (T * K), cache.q_size + cache.q_size / 2);
+            cache.s_size = std::max((size_t) T, cache.s_size + cache.s_size / 2);
+            CUDA_CHECK(cudaMalloc((void **) &cache.q, cache.q_size));
+            CUDA_CHECK(cudaMalloc((void **) &cache.s, cache.s_size * sizeof(float)));
+        }
+        const int rows_per_block = 8;
+        const dim3 grid((T + rows_per_block - 1) / rows_per_block);
+        const int threads = rows_per_block * WARP_SIZE;
+        if (K <= 4 * 16 * WARP_SIZE) {
+            mmi8_quantize_rows<16><<<grid, threads, 0, stream>>>(
+                (const char *) src1->data, cache.q, cache.s, K, T, src1->nb[1], src1->nb[2], src1->ne[1]);
+        } else {
+            mmi8_quantize_rows<0><<<grid, threads, 0, stream>>>(
+                (const char *) src1->data, cache.q, cache.s, K, T, src1->nb[1], src1->nb[2], src1->ne[1]);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        cache.graph       = cgraph;
+        cache.data        = cgraph != nullptr ? src1->data : nullptr;
+        cache.K           = K;
+        cache.n_rows      = T;
+        cache.nb1         = src1->nb[1];
+        cache.nb2         = src1->nb[2];
+        cache.ne1         = src1->ne[1];
+        cache.valid_until = cgraph != nullptr ? mmi8_valid_until(cgraph, node_idx, src1) : -1;
+    }
+    q = cache.q;
+    s = cache.s;
+}
+
 #ifdef GGML_CUDA_USE_CUTLASS
 namespace {
 using namespace cute;
@@ -147,40 +195,10 @@ void ggml_cuda_mul_mat_i8(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     const int64_t T = src1->ne[1] * src1->ne[2];
     cudaStream_t stream = ctx.stream();
 
-    // per-token int8 activations, reused from the previous I8 MUL_MAT on the same tensor when still valid
-    auto & cache = ctx.i8_act;
-    const bool hit = cgraph != nullptr && cache.graph == cgraph && cache.src == src1 && node_idx <= cache.valid_until;
-    if (!hit) {
-        if ((size_t) (T * K) > cache.q_size || (size_t) T > cache.s_size) {
-            // grow (never during a CUDA graph capture: the first evaluation of a new graph shape is not captured);
-            // the old buffers stay allocated because a captured graph may still refer to them
-            if (cache.q != nullptr) {
-                cache.retired.push_back(cache.q);
-                cache.retired.push_back(cache.s);
-            }
-            cache.q_size = std::max((size_t) (T * K), cache.q_size + cache.q_size / 2);
-            cache.s_size = std::max((size_t) T, cache.s_size + cache.s_size / 2);
-            CUDA_CHECK(cudaMalloc((void **) &cache.q, cache.q_size));
-            CUDA_CHECK(cudaMalloc((void **) &cache.s, cache.s_size * sizeof(float)));
-        }
-        const int rows_per_block = 8;
-        const dim3 grid((T + rows_per_block - 1) / rows_per_block);
-        const int threads = rows_per_block * WARP_SIZE;
-        if (K <= 4 * 16 * WARP_SIZE) {
-            mmi8_quantize_rows<16><<<grid, threads, 0, stream>>>(
-                (const char *) src1->data, cache.q, cache.s, K, T, src1->nb[1], src1->nb[2], src1->ne[1]);
-        } else {
-            mmi8_quantize_rows<0><<<grid, threads, 0, stream>>>(
-                (const char *) src1->data, cache.q, cache.s, K, T, src1->nb[1], src1->nb[2], src1->ne[1]);
-        }
-        CUDA_CHECK(cudaGetLastError());
-        cache.graph       = cgraph;
-        cache.src         = cgraph != nullptr ? src1 : nullptr;
-        cache.valid_until = cgraph != nullptr ? mmi8_valid_until(cgraph, node_idx, src1) : -1;
-    }
-    int8_t * xq = cache.q;
-    float  * xs = cache.s;
-    }
+    // per-token int8 activations, reused from the previous I8 product on the same data when still valid
+    int8_t * xq = nullptr;
+    float  * xs = nullptr;
+    mmi8_token_q8(ctx, src1, cgraph, node_idx, xq, xs);
 
     using C = mmi8_cfg;
     float * d = (float *) out->data;
@@ -216,12 +234,14 @@ void ggml_cuda_mul_mat_i8(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 #include "cutlass/epilogue/thread/linear_combination.h"
 
 namespace {
+// the int32 products leave the GEMM as f16, scaled into range (mmid_i8_d_scale), which halves the bytes the
+// epilogue pass reads
 struct mmid_i8_cfg {
-    using Epi = cutlass::epilogue::thread::LinearCombination<int32_t, 4, int32_t, int32_t>;
+    using Epi = cutlass::epilogue::thread::LinearCombination<cutlass::half_t, 8, int32_t, float>;
     using Kernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
         int8_t, cutlass::layout::RowMajor, cutlass::ComplexTransform::kNone, 16,
         int8_t, cutlass::layout::ColumnMajor, cutlass::ComplexTransform::kNone, 16,
-        int32_t, cutlass::layout::RowMajor, int32_t, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+        cutlass::half_t, cutlass::layout::RowMajor, int32_t, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
         cutlass::gemm::GemmShape<128, 128, 64>, cutlass::gemm::GemmShape<64, 64, 64>, cutlass::gemm::GemmShape<16, 8, 32>,
         Epi, cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle, 4,
         cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly, cutlass::arch::OpMultiplyAddSaturate>::GemmKernel;
@@ -268,11 +288,31 @@ static __global__ void mmid_i8_quantize_rows(const char * __restrict__ x, const 
     }
 }
 
+// compact row r <- the int8 row of its token (token = ids_fwd[r] / n_used), with its scale
+static __global__ void mmid_i8_gather_rows(const int8_t * __restrict__ q, const float * __restrict__ s,
+        const int32_t * __restrict__ ids_fwd, int8_t * __restrict__ A, float * __restrict__ sa, const int64_t K,
+        const int64_t n_rows, const int n_used) {
+    const int64_t row = (int64_t) blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    if (row >= n_rows) {
+        return;
+    }
+    const int64_t token = ids_fwd[row] / n_used;
+    const int4 * src = (const int4 *) (q + token * K);
+    int4 * dst = (int4 *) (A + row * K);
+    for (int64_t i = lane; i < K / 16; i += WARP_SIZE) {
+        dst[i] = src[i];
+    }
+    if (lane == 0) {
+        sa[row] = s[token];
+    }
+}
+
 #ifdef GGML_CUDA_USE_CUTLASS
 // the per-expert problems of the grouped GEMM from the expert bounds (device side, no host sync)
 static __global__ void mmid_i8_setup(const int32_t * __restrict__ bounds, const int E, const int N, const int K,
-        int8_t * A, const int8_t * W, const int64_t w_nb2, int32_t * D,
-        cutlass::gemm::GemmCoord * problems, int8_t ** pa, int8_t ** pb, int32_t ** pd,
+        int8_t * A, const int8_t * W, const int64_t w_nb2, cutlass::half_t * D,
+        cutlass::gemm::GemmCoord * problems, int8_t ** pa, int8_t ** pb, cutlass::half_t ** pd,
         int64_t * lda, int64_t * ldb, int64_t * ldd, const int64_t w_nb1) {
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= E) {
@@ -290,8 +330,19 @@ static __global__ void mmid_i8_setup(const int32_t * __restrict__ bounds, const 
 }
 #endif // GGML_CUDA_USE_CUTLASS
 
+// the GEMM writes acc * 2^-e as f16, with e such that K * 127^2 * 2^-e < 60000 (no overflow); the readers multiply back
+static float mmid_i8_d_scale(const int64_t K) {
+    return 1.0f / exp2f(ceilf(log2f((float) K * 16129.0f / 60000.0f)));
+}
+
+static __device__ __forceinline__ float4 mmid_i8_load4(const half * p, const float k) {
+    const float2 a = __half22float2(*(const half2 *) p);
+    const float2 b = __half22float2(*(const half2 *) (p + 2));
+    return make_float4(a.x * k, a.y * k, b.x * k, b.y * k);
+}
+
 // out[ids_dst[r]][n] = D[r][n] * sa[r] * sb[e(r)][n]; one block per (row, chunk of 4*blockDim columns): row in x
-static __global__ void mmid_i8_scatter(const int32_t * __restrict__ D, const float * __restrict__ sa,
+static __global__ void mmid_i8_scatter(const half * __restrict__ D, const float dk, const float * __restrict__ sa,
         const float * __restrict__ w_scale, const int32_t * __restrict__ bounds, const int32_t * __restrict__ ids_dst,
         float * __restrict__ out, const int E, const int N, const int64_t out_nb1) {
     const int64_t r = blockIdx.x;
@@ -311,7 +362,7 @@ static __global__ void mmid_i8_scatter(const int32_t * __restrict__ D, const flo
     if (n >= N) {
         return;
     }
-    const int4 d = *(const int4 *) (D + r * N + n);
+    const float4 d = mmid_i8_load4(D + r * N + n, dk);
     float4 o;
     if (w_scale != nullptr) {
         const float4 w = *(const float4 *) (w_scale + (int64_t) e * N + n);
@@ -336,7 +387,7 @@ static __device__ __forceinline__ int mmid_i8_expert_of_row(const int32_t * __re
 }
 
 // gate_up -> SwiGLU: out[slot][n] = silu(g) * u with g = D[r][n], u = D[r][n + H] (dequantized), H = N / 2
-static __global__ void mmid_i8_swiglu(const int32_t * __restrict__ D, const float * __restrict__ sa,
+static __global__ void mmid_i8_swiglu(const half * __restrict__ D, const float dk, const float * __restrict__ sa,
         const float * __restrict__ w_scale, const int32_t * __restrict__ bounds, const int32_t * __restrict__ ids_dst,
         float * __restrict__ out, const int E, const int N, const int64_t out_nb1) {
     const int64_t r = blockIdx.x;
@@ -347,8 +398,8 @@ static __global__ void mmid_i8_swiglu(const int32_t * __restrict__ D, const floa
     }
     const int e = mmid_i8_expert_of_row(bounds, E, r);
     const float s = sa[r];
-    const int4 dg = *(const int4 *) (D + r * N + n);
-    const int4 du = *(const int4 *) (D + r * N + H + n);
+    const float4 dg = mmid_i8_load4(D + r * N + n, dk);
+    const float4 du = mmid_i8_load4(D + r * N + H + n, dk);
     float4 wg = make_float4(1.0f, 1.0f, 1.0f, 1.0f), wu = wg;
     if (w_scale != nullptr) {
         wg = *(const float4 *) (w_scale + (int64_t) e * N + n);
@@ -363,7 +414,7 @@ static __global__ void mmid_i8_swiglu(const int32_t * __restrict__ D, const floa
 // down -> router-weighted sum over the token's experts: out[t][n] = sum_s w[s, t] * D[inv[t * n_used + s]][n] * ...
 // (only pool buffers are read: the output may share memory with the ids and router weights of the graph, which are
 // dead once the fused nodes are done)
-static __global__ void mmid_i8_reduce(const int32_t * __restrict__ D, const float * __restrict__ sa,
+static __global__ void mmid_i8_reduce(const half * __restrict__ D, const float dk, const float * __restrict__ sa,
         const float * __restrict__ w_scale, const int32_t * __restrict__ inv, const int32_t * __restrict__ bounds,
         const int E, const float * __restrict__ weights, float * __restrict__ out, const int N,
         const int n_used, const int64_t out_nb1) {
@@ -377,7 +428,7 @@ static __global__ void mmid_i8_reduce(const int32_t * __restrict__ D, const floa
         const int64_t r = inv[t * n_used + sl];
         const int e = mmid_i8_expert_of_row(bounds, E, r);
         const float f = sa[r] * weights[t * n_used + sl];
-        const int4 d = *(const int4 *) (D + r * N + n);
+        const float4 d = mmid_i8_load4(D + r * N + n, dk);
         float4 w = make_float4(1.0f, 1.0f, 1.0f, 1.0f);
         if (w_scale != nullptr) {
             w = *(const float4 *) (w_scale + (int64_t) e * N + n);
@@ -408,7 +459,7 @@ bool ggml_cuda_mul_mat_id_i8_supported(int device, const ggml_tensor * dst) {
 }
 
 void ggml_cuda_mul_mat_id_i8(ggml_backend_cuda_context & ctx, const ggml_tensor * mmid, const float * w_scale, ggml_tensor * out,
-        mmid_i8_epilogue epilogue, const ggml_tensor * weights) {
+        mmid_i8_epilogue epilogue, const ggml_tensor * weights, const ggml_cgraph * cgraph, int node_idx) {
 #ifdef GGML_CUDA_USE_CUTLASS
     const ggml_tensor * src0 = mmid->src[0];
     const ggml_tensor * src1 = mmid->src[1];
@@ -422,17 +473,40 @@ void ggml_cuda_mul_mat_id_i8(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int n_tokens = (int) src1->ne[2];
     const int64_t R = (int64_t) n_used * n_tokens;
 
-    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), R);
-    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), R);
-    ggml_cuda_pool_alloc<int32_t> bounds(ctx.pool(), E + 1);
-    {
+    // the expert sort (forward map: compact row -> token slot; inverse map; expert bounds), reused by the next I8
+    // MUL_MAT_ID on the same ids (gate_up then down) unless a later node overwrites them
+    auto & ic = ctx.i8_ids;
+    const bool ids_hit = cgraph != nullptr && ic.graph == cgraph && ic.ids == ids->data && ic.n_used == n_used &&
+        ic.n_tokens == n_tokens && ic.n_expert == E && ic.nb1 == (int64_t) ids->nb[1] && node_idx <= ic.valid_until;
+    if (!ids_hit) {
+        if ((size_t) R > ic.size || (size_t) (E + 1) > ic.bounds_size) {
+            if (ic.fwd != nullptr) {
+                ic.retired.push_back(ic.fwd);
+                ic.retired.push_back(ic.inv);
+                ic.retired.push_back(ic.bounds);
+            }
+            ic.size        = std::max((size_t) R, ic.size + ic.size / 2);
+            ic.bounds_size = std::max((size_t) (E + 1), ic.bounds_size);
+            CUDA_CHECK(cudaMalloc((void **) &ic.fwd, ic.size * sizeof(int32_t)));
+            CUDA_CHECK(cudaMalloc((void **) &ic.inv, ic.size * sizeof(int32_t)));
+            CUDA_CHECK(cudaMalloc((void **) &ic.bounds, ic.bounds_size * sizeof(int32_t)));
+        }
         const int si1  = (int) (ids->nb[1] / sizeof(int32_t));
         const int sis1 = (int) (src1->nb[2] / src1->nb[1]);
-        // ids_src1: the inverse map (token slot -> compact row), ids_dst: the forward map (compact row -> token slot)
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
+        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ic.inv, ic.fwd, ic.bounds,
             E, n_tokens, n_used, (int) src1->ne[1], si1, sis1, /*write_inverse =*/ true, stream);
         CUDA_CHECK(cudaGetLastError());
+        ic.graph       = cgraph;
+        ic.ids         = cgraph != nullptr ? ids->data : nullptr;
+        ic.n_used      = n_used;
+        ic.n_tokens    = n_tokens;
+        ic.n_expert    = E;
+        ic.nb1         = ids->nb[1];
+        ic.valid_until = cgraph != nullptr ? mmi8_valid_until(cgraph, node_idx, ids) : -1;
     }
+    int32_t * ids_inv = ic.inv;
+    int32_t * ids_fwd = ic.fwd;
+    int32_t * bounds  = ic.bounds;
 
     // the router weights, copied before anything is written (the fused output may reuse their memory)
     ggml_cuda_pool_alloc<float> w_copy(ctx.pool());
@@ -444,23 +518,31 @@ void ggml_cuda_mul_mat_id_i8(ggml_backend_cuda_context & ctx, const ggml_tensor 
 
     ggml_cuda_pool_alloc<int8_t> A(ctx.pool(), R * K);
     ggml_cuda_pool_alloc<float>  sa(ctx.pool(), R);
-    {
+    if (src1->ne[1] == 1) {
+        // the same input row for every expert of a token (gate_up): quantize each token once (shared with the dense
+        // products on the same data, e.g. the shared expert), then gather the int8 rows
+        int8_t * tq_q = nullptr;
+        float  * tq_s = nullptr;
+        mmi8_token_q8(ctx, src1, cgraph, node_idx, tq_q, tq_s);
+        mmid_i8_gather_rows<<<(R + 7) / 8, 8 * WARP_SIZE, 0, stream>>>(tq_q, tq_s, ids_fwd, A.get(), sa.get(), K, R, n_used);
+    } else {
         const int rows_per_block = 8;
         mmid_i8_quantize_rows<16><<<(R + rows_per_block - 1) / rows_per_block, rows_per_block * WARP_SIZE, 0, stream>>>(
-            (const char *) src1->data, ids_dst.get(), A.get(), sa.get(), K, R, src1->nb[1], src1->nb[2], n_used, (int) src1->ne[1]);
-        CUDA_CHECK(cudaGetLastError());
+            (const char *) src1->data, ids_fwd, A.get(), sa.get(), K, R, src1->nb[1], src1->nb[2], n_used, (int) src1->ne[1]);
     }
+    CUDA_CHECK(cudaGetLastError());
 
     using C = mmid_i8_cfg;
-    ggml_cuda_pool_alloc<int32_t> D(ctx.pool(), R * N);
+    const float d_scale = mmid_i8_d_scale(K);
+    ggml_cuda_pool_alloc<cutlass::half_t> D(ctx.pool(), R * N);
     ggml_cuda_pool_alloc<cutlass::gemm::GemmCoord> problems(ctx.pool(), E);
     ggml_cuda_pool_alloc<int8_t *>  pa(ctx.pool(), E);
     ggml_cuda_pool_alloc<int8_t *>  pb(ctx.pool(), E);
-    ggml_cuda_pool_alloc<int32_t *> pd(ctx.pool(), E);
+    ggml_cuda_pool_alloc<cutlass::half_t *> pd(ctx.pool(), E);
     ggml_cuda_pool_alloc<int64_t>   lda(ctx.pool(), E);
     ggml_cuda_pool_alloc<int64_t>   ldb(ctx.pool(), E);
     ggml_cuda_pool_alloc<int64_t>   ldd(ctx.pool(), E);
-    mmid_i8_setup<<<(E + 127) / 128, 128, 0, stream>>>(bounds.get(), E, N, K, A.get(), (const int8_t *) src0->data,
+    mmid_i8_setup<<<(E + 127) / 128, 128, 0, stream>>>(bounds, E, N, K, A.get(), (const int8_t *) src0->data,
         src0->nb[2], D.get(), problems.get(), pa.get(), pb.get(), pd.get(), lda.get(), ldb.get(), ldd.get(), src0->nb[1]);
     CUDA_CHECK(cudaGetLastError());
 
@@ -468,7 +550,7 @@ void ggml_cuda_mul_mat_id_i8(ggml_backend_cuda_context & ctx, const ggml_tensor 
     if (threadblock_count[ctx.device] == 0) {
         threadblock_count[ctx.device] = C::Gemm::maximum_active_blocks() * ggml_cuda_info().devices[ctx.device].nsm;
     }
-    typename C::Gemm::Arguments args(problems.get(), E, threadblock_count[ctx.device], {1, 0},
+    typename C::Gemm::Arguments args(problems.get(), E, threadblock_count[ctx.device], {d_scale, 0.0f},
         pa.get(), pb.get(), pd.get(), pd.get(), lda.get(), ldb.get(), ldd.get(), ldd.get(), nullptr);
     typename C::Gemm gemm;
     const size_t ws_size = gemm.get_workspace_size(args);
@@ -481,23 +563,23 @@ void ggml_cuda_mul_mat_id_i8(ggml_backend_cuda_context & ctx, const ggml_tensor 
     switch (epilogue) {
         case MMID_I8_SCATTER: {
             const dim3 grid((unsigned) R, (N / 4 + threads - 1) / threads);
-            mmid_i8_scatter<<<grid, threads, 0, stream>>>(D.get(), sa.get(), w_scale, bounds.get(), ids_dst.get(),
+            mmid_i8_scatter<<<grid, threads, 0, stream>>>((const half *) D.get(), 1.0f / d_scale, sa.get(), w_scale, bounds, ids_fwd,
                 (float *) out->data, E, N, out->nb[1]);
         } break;
         case MMID_I8_SWIGLU: {
             const dim3 grid((unsigned) R, (N / 8 + threads - 1) / threads);
-            mmid_i8_swiglu<<<grid, threads, 0, stream>>>(D.get(), sa.get(), w_scale, bounds.get(), ids_dst.get(),
+            mmid_i8_swiglu<<<grid, threads, 0, stream>>>((const half *) D.get(), 1.0f / d_scale, sa.get(), w_scale, bounds, ids_fwd,
                 (float *) out->data, E, N, out->nb[1]);
         } break;
         case MMID_I8_REDUCE: {
             const dim3 grid((unsigned) n_tokens, (N / 4 + threads - 1) / threads);
-            mmid_i8_reduce<<<grid, threads, 0, stream>>>(D.get(), sa.get(), w_scale, ids_src1.get(), bounds.get(), E,
+            mmid_i8_reduce<<<grid, threads, 0, stream>>>((const half *) D.get(), 1.0f / d_scale, sa.get(), w_scale, ids_inv, bounds, E,
                 w_copy.get(), (float *) out->data, N, n_used, out->nb[1]);
         } break;
     }
     CUDA_CHECK(cudaGetLastError());
 #else
-    GGML_UNUSED_VARS(ctx, mmid, w_scale, out, epilogue, weights);
+    GGML_UNUSED_VARS(ctx, mmid, w_scale, out, epilogue, weights, cgraph, node_idx);
     GGML_ABORT("the int8 GEMM needs a build with GGML_CUDA_CUTLASS_DIR");
 #endif // GGML_CUDA_USE_CUTLASS
 }

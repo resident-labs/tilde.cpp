@@ -3332,8 +3332,8 @@ bool ggml_prec_set_src(
             break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
-                // Q (0) and K (1): e.g. GGML_PREC_Q8 lets the implementation compute Q*K^T in int8
-                if (idx != 0 && idx != 1) {
+                // Q (0) and K (1): e.g. GGML_PREC_Q8 lets the implementation compute Q*K^T in int8; V (2): P*V in int8
+                if (idx < 0 || idx > 2) {
                     return false;
                 }
 

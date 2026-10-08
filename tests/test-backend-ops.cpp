@@ -5027,11 +5027,11 @@ struct test_flash_attn_ext_i8 : public test_case {
     const bool acc16;
 
     std::string vars() override {
-        return VARS_TO_STR4(nh, n_q, n_kv, acc16);
+        return VARS_TO_STR5(nh, n_q, n_kv, acc16, pv8);
     }
 
     double max_nmse_err() override {
-        return 2e-3; // int8 Q and K
+        return 2e-3; // int8 Q and K (and P, V)
     }
 
     uint64_t op_flops(ggml_tensor * t) override {
@@ -5039,8 +5039,10 @@ struct test_flash_attn_ext_i8 : public test_case {
         return 2 * nh * n_q * n_kv * (192 + 128);
     }
 
-    test_flash_attn_ext_i8(int64_t nh = 4, int64_t n_q = 200, int64_t n_kv = 200, bool acc16 = false)
-        : nh(nh), n_q(n_q), n_kv(n_kv), acc16(acc16) {}
+    const bool pv8 = false;
+
+    test_flash_attn_ext_i8(int64_t nh = 4, int64_t n_q = 200, int64_t n_kv = 200, bool acc16 = false, bool pv8 = false)
+        : nh(nh), n_q(n_q), n_kv(n_kv), acc16(acc16), pv8(pv8) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 192, n_q,  nh);
@@ -5055,6 +5057,9 @@ struct test_flash_attn_ext_i8 : public test_case {
         ggml_prec_set_acc(out, GGML_PREC_F32);
         ggml_prec_set_src(out, GGML_PREC_Q8, 0);
         ggml_prec_set_src(out, GGML_PREC_Q8, 1);
+        if (pv8) {
+            ggml_prec_set_src(out, GGML_PREC_Q8, 2);
+        }
         return out;
     }
 };
@@ -11861,6 +11866,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_i8(2, 4096, 4096));
     test_cases.emplace_back(new test_flash_attn_ext_i8(4, 1000, 777, true));
     test_cases.emplace_back(new test_flash_attn_ext_i8(2, 4096, 4096, true));
+    test_cases.emplace_back(new test_flash_attn_ext_i8(4, 200, 200, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext_i8(4, 1000, 777, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext_i8(2, 4096, 4096, false, true));
     // CUDA chunked prefill kernel (head_size 128, >= 64 tokens): scalar and KDA gates, partial last chunk,
     // several segments of 4096 tokens, v heads > q/k heads, permuted q/k, two sequences
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,   64, 1));
@@ -11965,6 +11973,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // non-causal MLA prefill with decompressed K/V (Tilde: 16 heads, 192/128, no mask)
     test_cases.emplace_back(new test_flash_attn_ext_i8(16, 32768, 32768));
     test_cases.emplace_back(new test_flash_attn_ext_i8(16, 32768, 32768, true));
+    test_cases.emplace_back(new test_flash_attn_ext_i8(16, 32768, 32768, false, true));
     test_cases.emplace_back(new test_flash_attn_ext(192, 128, 16, {1, 1}, 32768, 32768, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(192, 128, 16, {1, 1},  4096,  4096, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     // KDA prefill (Ling-3.0 / Tilde shapes)

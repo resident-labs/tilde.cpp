@@ -29,4 +29,5 @@ enum mmid_i8_epilogue {
     MMID_I8_REDUCE,
 };
 void ggml_cuda_mul_mat_id_i8(ggml_backend_cuda_context & ctx, const ggml_tensor * mmid, const float * w_scale, ggml_tensor * out,
-        mmid_i8_epilogue epilogue = MMID_I8_SCATTER, const ggml_tensor * weights = nullptr);
+        mmid_i8_epilogue epilogue = MMID_I8_SCATTER, const ggml_tensor * weights = nullptr,
+        const ggml_cgraph * cgraph = nullptr, int node_idx = -1);

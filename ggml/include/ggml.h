@@ -1472,6 +1472,7 @@ extern "C" {
     //   - GGML_OP_FLASH_ATTN_EXT, idx 0 (Q) and 1 (K), stored in op_params[5] and [6]:
     //     - GGML_PREC_Q8 on both allows int8 Q*K^T (SageAttention-style: K smoothed by its mean, one scale per row,
     //       P*V in f16 within a tile of keys); the CUDA backend implements it on Ampere and newer (fattn-i8.cu)
+    //     - GGML_PREC_Q8 on idx 2 (V, op_params[7]) as well also allows int8 P*V (P per row and key tile, V per channel)
     //
     // return false on faliure
     GGML_API bool ggml_prec_set_src(

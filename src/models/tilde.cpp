@@ -464,6 +464,15 @@ static int64_t tilde_chunk_tokens() {
 }
 
 // int8 Q*K^T in the MLA flash attention (TILDE_FA_INT8=0 turns it off)
+// int8 P*V in the MLA flash attention (TILDE_FA_PV8=1; off by default)
+static bool tilde_fa_pv8() {
+    static const bool v = [] {
+        const char * env = getenv("TILDE_FA_PV8");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return v;
+}
+
 static bool tilde_fa_int8() {
     static const bool value = [] {
         const char * env = std::getenv("TILDE_FA_INT8");
@@ -742,6 +751,9 @@ ggml_tensor * llama_model_tilde::graph::build_layer_mla(ggml_tensor * cur, ggml_
             // the hint.
             ggml_prec_set_src(cur, GGML_PREC_Q8, 0);
             ggml_prec_set_src(cur, GGML_PREC_Q8, 1);
+            if (tilde_fa_pv8()) {
+                ggml_prec_set_src(cur, GGML_PREC_Q8, 2); // int8 P*V too (speed preset, measured separately)
+            }
         }
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0] * cur->ne[1], cur->ne[2] * cur->ne[3]);
     } else {
