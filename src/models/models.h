@@ -1996,7 +1996,7 @@ struct llama_model_tilde : public llama_model_bailingmoe3 {
         ggml_tensor * build_head_norm(ggml_tensor * cur, const norm & n);
         ggml_tensor * build_head_attn(ggml_tensor * q, ggml_tensor * kv, const attn & a);
         ggml_tensor * build_head_ffn(ggml_tensor * cur, const head_layer & layer);
-        ggml_tensor * build_span_means(ggml_tensor * rows, ggml_tensor * const * pools, size_t n_pools);
+        ggml_tensor * build_span_means(ggml_tensor * table, ggml_tensor * ids, ggml_tensor * const * pools, size_t n_pools);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

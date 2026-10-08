@@ -1,4 +1,7 @@
 #include "gated_delta_net.cuh"
+#include "gated_delta_net_chunked.cuh"
+
+#include <cstdlib>
 #include "ggml-cuda/common.cuh"
 
 template <int S_v, bool KDA, bool keep_rs_t>
@@ -292,6 +295,18 @@ static void ggml_cuda_op_gated_delta_net_impl(
     if (cache != nullptr) {
         state_d           = cache->data;
         state_slot_stride = cache->slot_stride;
+    }
+
+    // long batches (prefill): chunked form, many times faster than the per-token recurrence
+    // GGML_CUDA_GDN_CHUNKED=0 keeps the per-token kernel
+    static const bool chunked_enabled = [] {
+        const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (chunked_enabled && !keep_rs && n_tokens >= 64 &&
+            ggml_cuda_gated_delta_net_chunked(ctx, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, kda, S_v, H, neqk1,
+                n_tokens, n_seqs, rq3, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, scale, stream)) {
+        return;
     }
 
     if (kda) {

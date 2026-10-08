@@ -424,7 +424,9 @@ static ggml_tensor * tilde_chunked(ggml_context * ctx, ggml_tensor * x, int64_t 
         ggml_tensor * yc = fn(xc);
         GGML_ASSERT(yc->ne[1] == n && ggml_is_contiguous(yc));
         if (out == nullptr) {
-            out = ggml_pad(ctx, yc, 0, (int) (n_tokens - n), 0, 0);
+            // padded as 1D: a [ne0, n_tokens] pad puts n_tokens in a CUDA grid dimension capped at 65535
+            out = ggml_pad(ctx, ggml_reshape_1d(ctx, yc, ggml_nelements(yc)), (int) (yc->ne[0] * (n_tokens - n)), 0, 0, 0);
+            out = ggml_reshape_2d(ctx, out, yc->ne[0], n_tokens);
         } else {
             out = ggml_set_2d_inplace(ctx, out, yc, out->nb[1], t0 * out->nb[1]);
         }
@@ -434,7 +436,7 @@ static ggml_tensor * tilde_chunked(ggml_context * ctx, ggml_tensor * x, int64_t 
 
 llama_model_tilde::graph::graph(const llama_model & model_base, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(static_cast<const llama_model_tilde &>(model_base)) {
-    GGML_ASSERT(ubatch.n_seqs_unq == 1 && "tilde: one request (sequence) per batch");
+    // one request per batch: a batch with several sequences gets NaN scores (tilde_get_spans), like clef
 
     ggml_tensor * inpL = build_inp_embd(model.tok_embd);
     cb(inpL, "model.input_embed", -1);
@@ -509,8 +511,8 @@ llama_model_tilde::graph::graph(const llama_model & model_base, const llm_graph_
     // the head is always evaluated, so that the graph has the same nodes for every batch
     cur = build_head(cur, inp_decision);
 
-    // row i of the output is the score of option i
-    cur = ggml_pad(ctx0, cur, 0, n_tokens - cur->ne[1], 0, 0);
+    // row i of the output is the score of option i (padded as 1D, see tilde_chunked)
+    cur = ggml_reshape_2d(ctx0, ggml_pad(ctx0, ggml_reshape_1d(ctx0, cur, cur->ne[1]), n_tokens - cur->ne[1], 0, 0, 0), 1, n_tokens);
     cur = ggml_add(ctx0, cur, inp_decision->status);
     cb(cur, "result_decision", -1);
 
@@ -555,8 +557,12 @@ ggml_tensor * llama_model_tilde::graph::build_layer_kda(ggml_tensor * cur, int i
     ggml_tensor * beta = ggml_mul_mat(ctx0, layer.ssm_beta, cur);
     beta = ggml_sigmoid(ctx0, ggml_reshape_4d(ctx0, beta, 1, n_head, n_tokens, n_seqs));
 
-    q = build_gdn_l2_norm(ctx0, q, hparams.f_norm_rms_eps);
-    k = build_gdn_l2_norm(ctx0, k, hparams.f_norm_rms_eps);
+    // the norms run on [head_dim, n_head * n_tokens]: a [head_dim, n_head, n_tokens] launch puts n_tokens in a grid
+    // dimension that CUDA caps at 65535
+    q = ggml_reshape_4d(ctx0, build_gdn_l2_norm(ctx0, ggml_reshape_2d(ctx0, q, head_dim, n_head * n_tokens), hparams.f_norm_rms_eps),
+            head_dim, n_head, n_tokens, n_seqs);
+    k = ggml_reshape_4d(ctx0, build_gdn_l2_norm(ctx0, ggml_reshape_2d(ctx0, k, head_dim, n_head * n_tokens), hparams.f_norm_rms_eps),
+            head_dim, n_head, n_tokens, n_seqs);
 
     ggml_tensor * state = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, head_dim, head_dim, n_head, n_seqs), 0.0f);
 
@@ -565,8 +571,9 @@ ggml_tensor * llama_model_tilde::graph::build_layer_kda(ggml_tensor * cur, int i
 
     ggml_tensor * out_gate = ggml_mul_mat(ctx0, layer.ssm_g_a, cur);
     out_gate = ggml_reshape_3d(ctx0, out_gate, head_dim, n_head, n_tokens);
-    out = ggml_reshape_3d(ctx0, ggml_cont(ctx0, out), head_dim, n_head, n_tokens);
+    out = ggml_reshape_2d(ctx0, ggml_cont(ctx0, out), head_dim, n_head * n_tokens);
     out = build_norm(out, layer.ssm_o_norm, nullptr, LLM_NORM_RMS, il);
+    out = ggml_reshape_3d(ctx0, out, head_dim, n_head, n_tokens);
     out = ggml_mul(ctx0, out, ggml_sigmoid(ctx0, out_gate));
     cur = ggml_mul_mat(ctx0, layer.wo, ggml_cont_2d(ctx0, out, d_inner, n_tokens));
     cb(cur, "kda_out", il);
@@ -631,13 +638,22 @@ ggml_tensor * llama_model_tilde::graph::build_layer_mla(ggml_tensor * cur, ggml_
     ggml_tensor * v = ggml_view_3d(ctx0, kvb, v_head_dim, n_head, n_tokens,
             es * (qk_nope_head_dim + v_head_dim), kvb->nb[1], es * qk_nope_head_dim);
 
-    ggml_tensor * q = ggml_concat(ctx0, q_nope, q_pe, 0);
-    ggml_tensor * k = ggml_concat(ctx0, k_nope, ggml_repeat_4d(ctx0, k_pe, qk_rope_head_dim, n_head, n_tokens, 1), 0);
+    // concatenations as [dim, n_head * n_tokens] (a 3D launch caps n_tokens at 65535 on CUDA)
+    auto flat = [&](ggml_tensor * t) {
+        return ggml_view_2d(ctx0, t, t->ne[0], t->ne[1] * t->ne[2], t->nb[1], 0);
+    };
+    ggml_tensor * k_pe_rep = ggml_repeat_4d(ctx0, k_pe, qk_rope_head_dim, n_head, n_tokens, 1);
+    ggml_tensor * q = ggml_reshape_3d(ctx0, ggml_concat(ctx0, flat(q_nope), flat(q_pe), 0), qk_head_dim, n_head, n_tokens);
+    ggml_tensor * k = ggml_reshape_3d(ctx0, ggml_concat(ctx0, flat(k_nope), flat(k_pe_rep), 0), qk_head_dim, n_head, n_tokens);
     v = ggml_cont(ctx0, v);
     cb(q, "q_full", il);
     cb(k, "k_full", il);
 
-    // no mask: one sequence, every token attends to every token
+    // no mask: one sequence, every token attends to every token. Without flash attention the scores would be
+    // materialized as [n_tokens, n_tokens, n_head]: refuse long requests instead of trying to allocate them.
+    if (!cparams.flash_attn && n_tokens > 8192) {
+        throw std::runtime_error("tilde: requests over 8192 tokens need flash attention (-fa on)");
+    }
     cur = build_attn_mha(q, k, v, nullptr, nullptr, nullptr, nullptr, n_tokens, kq_scale, il);
     cb(cur, "mla_attn", il);
 
@@ -688,19 +704,21 @@ ggml_tensor * llama_model_tilde::graph::build_head_ffn(ggml_tensor * cur, const 
     return ggml_add(ctx0, ggml_mul_mat(ctx0, layer.ffn_down, cur), layer.ffn_down_b);
 }
 
-// rows: [n_embd, n_gathered]; returns [n_embd, n_spans], the mean of each span
-ggml_tensor * llama_model_tilde::graph::build_span_means(ggml_tensor * rows, ggml_tensor * const * pools, size_t n_pools) {
+// mean of each span of rows of `table` (gathered by `ids`, I32 [n_gathered], span by span);
+// returns [n_embd, n_spans]. Gathered per chunk, so the copies stay chunk-sized.
+ggml_tensor * llama_model_tilde::graph::build_span_means(ggml_tensor * table, ggml_tensor * ids, ggml_tensor * const * pools, size_t n_pools) {
     ggml_tensor * res = nullptr;
     int64_t tok0 = 0;
     for (size_t c = 0; c < n_pools; c++) {
         ggml_tensor * pool = pools[c];
         const int64_t n_tok = pool->ne[0];
-        ggml_tensor * part = ggml_view_2d(ctx0, rows, rows->ne[0], n_tok, rows->nb[1], tok0 * rows->nb[1]);
-        part = ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, part)), pool); // [n_embd, chunk spans]
+        ggml_tensor * idx  = ggml_view_1d(ctx0, ids, n_tok, tok0 * ggml_element_size(ids));
+        ggml_tensor * part = ggml_get_rows(ctx0, table, idx);                                     // [n_embd, n_tok]
+        part = ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, part)), pool);            // [n_embd, chunk spans]
         res = res ? ggml_concat(ctx0, res, part, 1) : part;
         tok0 += n_tok;
     }
-    GGML_ASSERT(tok0 == rows->ne[1]);
+    GGML_ASSERT(tok0 == ids->ne[0]);
     return res;
 }
 
@@ -738,11 +756,11 @@ ggml_tensor * llama_model_tilde::graph::build_head(ggml_tensor * hidden, input_d
     ggml_tensor * global = ggml_view_2d(ctx0, hidden, n_embd, 1, hidden->nb[1], (n_tokens - 1) * hidden->nb[1]);
 
     // mean of the hidden states over each span
-    ggml_tensor * question = build_span_means(ggml_get_rows(ctx0, hidden, inp->q_rows), inp->q_pools.data(), inp->q_pools.size());
-    ggml_tensor * opt_ctx  = build_span_means(ggml_get_rows(ctx0, hidden, inp->o_rows), inp->o_pools.data(), inp->o_pools.size());
+    ggml_tensor * question = build_span_means(hidden, inp->q_rows, inp->q_pools.data(), inp->q_pools.size());
+    ggml_tensor * opt_ctx  = build_span_means(hidden, inp->o_rows, inp->o_pools.data(), inp->o_pools.size());
 
     // mean of the output embeddings of the tokens of each option
-    ggml_tensor * lexical = build_span_means(ggml_get_rows(ctx0, model.output, inp->o_ids), inp->o_pools.data(), inp->o_pools.size());
+    ggml_tensor * lexical = build_span_means(model.output, inp->o_ids, inp->o_pools.data(), inp->o_pools.size());
     cb(question, "decision_question", -1);
     cb(lexical,  "decision_lexical", -1);
 

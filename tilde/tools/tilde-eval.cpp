@@ -178,6 +178,23 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "%s: %zu tokens > %d, skipped\n", r.id.c_str(), r.ids.size(), max_tokens);
             continue;
         }
+        // spans must be separated by at least one unmarked token, or the model would merge them
+        {
+            std::vector<std::pair<int, int>> spans;
+            for (const auto & q : r.questions) {
+                spans.push_back({q.start, q.end});
+                for (const auto & o : q.options) spans.push_back(o);
+            }
+            std::sort(spans.begin(), spans.end());
+            for (size_t i = 0; i < spans.size(); i++) {
+                const bool bad = spans[i].first >= spans[i].second || spans[i].first < 0 || spans[i].second > (int) r.ids.size() ||
+                                 (i > 0 && spans[i].first <= spans[i - 1].second);
+                if (bad) {
+                    fprintf(stderr, "%s: invalid or adjacent spans\n", r.id.c_str());
+                    return 1;
+                }
+            }
+        }
         std::vector<int32_t> order(r.ids.size(), LLAMA_DECISION_ORDER_NONE);
         size_t n_options = 0;
         for (const auto & q : r.questions) {

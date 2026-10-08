@@ -190,6 +190,9 @@ int main(int argc, char ** argv) {
     if (!has_arg(args, {"-b", "--batch-size"}))     args.insert(args.end(), {"-b", n_str});
     if (!has_arg(args, {"-ub", "--ubatch-size"}))   args.insert(args.end(), {"-ub", n_str});
     if (!has_arg(args, {"-np", "--parallel"}))      args.insert(args.end(), {"-np", "1"});
+    // flash attention is required above 8k tokens; "on" also keeps it when a GPU lacks the kernel (that op then
+    // runs on the CPU) instead of turning it off for every layer as "auto" would
+    if (!has_arg(args, {"-fa", "--flash-attn"}))    args.insert(args.end(), {"-fa", "on"});
     if (!has_arg(args, {"-ngl", "--gpu-layers", "--n-gpu-layers"})) args.insert(args.end(), {"-ngl", "999"});
     if (!has_arg(args, {"-a", "--alias"}))          args.insert(args.end(), {"--alias", "tilde-8b-a1b"});
     if (n_tokens < 65536 && !has_arg(args, {"--tilde-max-request-tokens"})) {

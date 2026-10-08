@@ -270,6 +270,9 @@ class TildeModel(BailingMoeV3Model):
         w = self.gguf_writer
         cls = type(self)
         report = cls.report
+        # route the number of experts the checkpoint was trained with (the base config's value is only a default)
+        k = report.get("experts_per_token") or self.hparams["num_experts_per_tok"]
+        w.add_expert_used_count(int(k))
         w.add_decision_type(gguf.DecisionType.TILDE)
         w.add_decision_routing_block_count(JOINT_HEAD_CONFIG["routing_layers"])
         w.add_decision_block_count(JOINT_HEAD_CONFIG["layers"])

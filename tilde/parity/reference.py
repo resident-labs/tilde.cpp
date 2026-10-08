@@ -155,6 +155,8 @@ def metrics_for(records, outputs):
         if logits is None:
             continue
         for question, row in zip(record["questions"], logits, strict=True):
+            if not all(math.isfinite(x) for x in row):
+                continue  # counted separately (compare: nonfinite_fields)
             probs = softmax(row)
             target = question["target"]
             gold = max(range(len(target)), key=target.__getitem__)
