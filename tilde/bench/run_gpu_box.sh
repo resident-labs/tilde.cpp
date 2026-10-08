@@ -15,6 +15,7 @@
 #   WORK      working directory ($HOME/tilde-box)
 #   JOBS      build parallelism (nproc)
 #   UPLOAD    1 = upload the results to the staging repo (default 1)
+#   GGUF_DIR  (dry runs) take the GGUFs from this directory instead of downloading them
 # Needs: NVIDIA driver + CUDA toolkit >= 12.8 (nvcc), git, python3 (pip is used for cmake / hf if they are missing).
 set -euo pipefail
 
@@ -39,8 +40,10 @@ T0=$(date +%s)
 # --- tools -----------------------------------------------------------------------------------------------------------
 log "box: $(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader | head -1), $(nproc) cpus"
 [ -n "${HF_TOKEN:-}" ] || die "set HF_TOKEN (read/write on $STAGING)"
-NVCC=$(command -v nvcc || true)
+# the toolkit's own nvcc (a bare nvcc on PATH may be a wrapper without the toolkit headers next to it)
+NVCC=${NVCC:-}
 [ -z "$NVCC" ] && [ -x /usr/local/cuda/bin/nvcc ] && NVCC=/usr/local/cuda/bin/nvcc
+[ -z "$NVCC" ] && NVCC=$(command -v nvcc || true)
 [ -n "$NVCC" ] || die "no nvcc (CUDA toolkit >= 12.8 needed)"
 export PATH=$(dirname "$NVCC"):$PATH
 CUDA_VER=$("$NVCC" --version | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p')
@@ -67,7 +70,12 @@ log "commit $COMMIT"
 fetch "src/tilde.cpp-$COMMIT.tar.gz"
 fetch "data/*"
 for p in $PRESETS; do
-    fetch "gguf/tilde-8b-a1b-$p.gguf"
+    if [ -n "${GGUF_DIR:-}" ]; then
+        # dry runs: GGUFs already on disk
+        mkdir -p "$WORK/staging/gguf" && ln -sf "$GGUF_DIR/tilde-8b-a1b-$p.gguf" "$WORK/staging/gguf/"
+    else
+        fetch "gguf/tilde-8b-a1b-$p.gguf"
+    fi
 done
 S=$WORK/staging
 [ -f "$S/src/tilde.cpp-$COMMIT.tar.gz" ] || die "source tarball missing"
@@ -79,7 +87,7 @@ rm -rf "$WORK/src" && mkdir -p "$WORK/src"
 tar -xzf "$S/src/tilde.cpp-$COMMIT.tar.gz" -C "$WORK/src"
 [ -d "$WORK/cutlass" ] || git clone --quiet --depth 1 --branch "$CUTLASS_TAG" https://github.com/NVIDIA/cutlass "$WORK/cutlass"
 log "building $COMMIT for $ARCH with $JOBS jobs"
-cmake -S "$WORK/src" -B "$WORK/build" -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$ARCH" \
+cmake -S "$WORK/src" -B "$WORK/build" -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$ARCH" -DCMAKE_CUDA_COMPILER="$NVCC" \
     -DGGML_CUDA_CUTLASS_DIR="$WORK/cutlass" -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=ON > "$RES/cmake.log" 2>&1 \
     || { tail -30 "$RES/cmake.log"; die "cmake failed"; }
 cmake --build "$WORK/build" -j "$JOBS" --target tilde-eval tilde-server test-backend-ops > "$RES/build.log" 2>&1 \
