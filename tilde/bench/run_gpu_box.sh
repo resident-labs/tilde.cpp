@@ -11,7 +11,8 @@
 #   COMMIT    tilde.cpp commit of the source tarball in the staging repo (src/tilde.cpp-<COMMIT>.tar.gz); default: the
 #             one named in src/LATEST there
 #   ARCH      CMAKE_CUDA_ARCHITECTURES (120a-real for the 5090: the FP4 tensor-core instructions need the "a" target)
-#   PRESETS   GGUF presets to run ("Q8_0 Q4_KE I8CX NVFP4E"); I8CX also runs with int8 P*V (I8CX+PV8)
+#   PRESETS   GGUF presets to run ("Q8_0 Q4_KE I8CX NVFP4E"); I8CX also runs with int8 P*V (I8CX+PV8) and with the
+#             SageAttention2-style attention (I8CX+FAST)
 #   WORK      working directory ($HOME/tilde-box)
 #   JOBS      build parallelism (nproc)
 #   UPLOAD    1 = upload the results to the staging repo (default 1)
@@ -110,22 +111,23 @@ grep -E "tests passed|FAIL" "$RES/tests.log" | sort | uniq -c | tee "$RES/tests_
 RUNS=""
 for p in $PRESETS; do
     RUNS="$RUNS $p"
-    [ "$p" = I8CX ] && RUNS="$RUNS I8CX+PV8"
+    [ "$p" = I8CX ] && RUNS="$RUNS I8CX+PV8 I8CX+FAST"
 done
 # peak VRAM per run: sample nvidia-smi while each preset runs
 vram_watch() { while true; do nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1; sleep 0.5; done; }
 for r in $RUNS; do
-    p=${r%+PV8}
-    pv=0; [ "$r" != "$p" ] && pv=1
+    p=${r%%+*}
+    pv=0; fast=0
+    case "$r" in *+PV8) pv=1 ;; *+FAST) fast=1 ;; esac
     M=$S/gguf/tilde-8b-a1b-$p.gguf
     log "$r: DEV slice parity"
-    TILDE_FA_PV8=$pv $B/tilde-eval -m "$M" --records "$S/data/dev_slice.jsonl" --out "$RES/par_$r.jsonl" -ngl 999 \
+    TILDE_FA_PV8=$pv TILDE_FA_FAST=$fast $B/tilde-eval -m "$M" --records "$S/data/dev_slice.jsonl" --out "$RES/par_$r.jsonl" -ngl 999 \
         > "$RES/par_$r.log" 2>&1 || { tail -20 "$RES/par_$r.log"; die "tilde-eval failed ($r parity)"; }
     python3 "$WORK/src/tilde/parity/reference.py" compare --records "$S/data/dev_slice.jsonl" --ref "$S/data/ref_dev_slice.jsonl" \
         --test "$RES/par_$r.jsonl" --json "$RES/par_$r.json" > /dev/null
     log "$r: 1k..64k sweep"
     vram_watch > "$RES/vram_$r.txt" & W=$!
-    TILDE_FA_PV8=$pv $B/tilde-eval -m "$M" --records "$S/data/bench_records.jsonl" --out "$RES/time_$r.jsonl" -ngl 999 \
+    TILDE_FA_PV8=$pv TILDE_FA_FAST=$fast $B/tilde-eval -m "$M" --records "$S/data/bench_records.jsonl" --out "$RES/time_$r.jsonl" -ngl 999 \
         --repeat 3 --max-tokens 65536 > "$RES/time_$r.log" 2>&1 || { kill $W; tail -20 "$RES/time_$r.log"; die "tilde-eval failed ($r sweep)"; }
     kill $W 2>/dev/null || true
 done
