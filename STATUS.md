@@ -1,6 +1,6 @@
 # tilde.cpp status
 
-Last updated 2026-10-08 07:15 CDT (commit 507f5368d). Every number below was measured on hermeslab (RTX 3090 Ti 24 GB,
+Last updated 2026-10-08 08:15 CDT (commit 64787c69e). Every number below was measured on hermeslab (RTX 3090 Ti 24 GB,
 i7-12700K, CUDA 13.1). Nothing is extrapolated. The RTX 5090 run is packaged (see the end) and not run yet.
 
 ## Where we are
@@ -17,8 +17,10 @@ One 32,768-token request, warm, RTX 3090 Ti:
 | **I8CX+FAST (tilde-eval / server)** | **1,180 / 1,244** | **1.84x** |
 
 The 1,000 ms target is not reached on the 3090 Ti. I8CX+FAST is the fastest configuration inside the accuracy budget
-(1.0 pt, +0.01 log loss) and is the recommended CUDA setting for Ampere and newer; it is opt-in (`TILDE_FA_FAST=1`) until
-the lead flips the default. The kernel profile and what is left are at the end.
+(1.0 pt, +0.01 log loss) and is the default (Ari, 2026-10-08): `tilde-server` picks it with no flags on NVIDIA Ampere or
+newer with a CUTLASS build and the memory for 65,536-token requests (otherwise Q8_0, or Q4_KE when memory is short),
+logs why, and reports it in `GET /health`; a preset tag, `-m` or `TILDE_FA_FAST=0` override it. The kernel profile and
+what is left are at the end.
 
 Presets:
 - **Q8_0** (default GGUF, every backend), **Q6_KE**, **Q4_KE** (12 / 8 GB cards), **NVFP4E / MXFP4E** (4-bit experts;
@@ -147,7 +149,7 @@ History at 32k (tilde-eval, warm): 2,092 (Q8_0, GDN v4) -> 1,911 (I8C) -> 1,642 
 1,530 (v12, int8 P*V) -> 1,384 (cast elision, MoE reduce + residual, warp norms, fused routing) -> 1,311 (head F16, GDN
 f16 temporaries, int8 rows from SwiGLU and norms) -> 1,180 (I8CX+FAST).
 
-## RTX 5090 test (packaged, not run)
+## RTX 5090 test (packaged; box rented 08:10, running)
 
 `tilde/bench/run_gpu_box.sh` with everything in the private HF repo `resident-labs/tilde-8b-a1b-GGUF-staging`
 (`src/` tarball of the pushed commit, `gguf/` Q8_0, Q4_KE, I8CX, NVFP4E, `data/` a 400-record public-source DEV slice
@@ -155,7 +157,8 @@ with PyTorch logits, the 1k-64k bench records with PyTorch logits, 3090 Ti resul
 toolkit: `HF_TOKEN=... bash run_gpu_box.sh` builds for `120a-real` with CUTLASS 3.9.2, runs the kernel tests, then per
 preset (Q8_0, Q4_KE, I8CX, I8CX+PV8, I8CX+FAST, NVFP4E) the DEV-slice gates, the 1k-64k sweep, peak VRAM and the
 long-request |dp| against PyTorch, and uploads `results/<gpu>-<date>/summary.md`. It drops the token and any cached hf
-credential on exit. Dry run on hermeslab (arch 86): 846 s end to end.
+credential on exit, and also runs the `tilde-server` default path (no flags) with `/health`. Dry runs on hermeslab
+(arch 86): full package with the 28 GB download from HF 1,180 s; the default-path step 635 s (server 32k 1,250 ms).
 
 ## Open problems / what is left
 
