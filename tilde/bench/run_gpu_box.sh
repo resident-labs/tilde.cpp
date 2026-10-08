@@ -32,6 +32,14 @@ CUTLASS_TAG=v3.9.2
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 die() { echo "error: $*" >&2; exit 1; }
 
+# the token is only for this run: drop it and any cached hf credential on every exit, failures included
+cleanup() {
+    unset HF_TOKEN HUGGING_FACE_HUB_TOKEN
+    rm -f "$HOME/.cache/huggingface/token" "${HF_HOME:-$HOME/.cache/huggingface}/token" "$HOME/.huggingface/token"
+    rm -rf "$HOME/.cache/huggingface/stored_tokens" "${HF_HOME:-$HOME/.cache/huggingface}/stored_tokens"
+}
+trap cleanup EXIT
+
 mkdir -p "$WORK" && cd "$WORK"
 RES=$WORK/results
 mkdir -p "$RES"
