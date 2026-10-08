@@ -204,3 +204,97 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
                           out->nb[2], nc, nr, n_t, n_s, stream);
     }
 }
+
+// CONCAT(state, transpose(x)) -> SSM_CONV -> SILU in one pass (the causal conv of linear-attention prefill):
+// x is read where it is ([channels, tokens], token-major), the concatenated [d_conv - 1 + n_t, channels] copy is never
+// written. One thread per channel walks a tile of tokens with a sliding window, so every load and store is coalesced
+// across the channels.
+template <int d_conv>
+static __global__ void ssm_conv_concat_silu_f32(
+        const char * __restrict__ state, const int64_t st_nb1, const int64_t st_nb2,      // [d_conv - 1, nr, n_s]
+        const char * __restrict__ x, const int64_t x_nb0, const int64_t x_nb1, const int64_t x_nb2, // view [n_t, nr, n_s]
+        const char * __restrict__ w, const int64_t w_nb1,                                  // [d_conv, nr]
+        char * __restrict__ dst, const int64_t d_nb1, const int64_t d_nb2,                 // [nr, n_t, n_s]
+        const int nr, const int64_t n_t, const int tile) {
+    const int c = blockIdx.y * blockDim.x + threadIdx.x;
+    const int s = blockIdx.z;
+    if (c >= nr) {
+        return;
+    }
+    const int64_t t0 = (int64_t) blockIdx.x * tile;
+    const int64_t t1 = min(t0 + tile, n_t);
+
+    float wc[d_conv];
+#pragma unroll
+    for (int j = 0; j < d_conv; j++) {
+        wc[j] = ((const float *) (w + c * w_nb1))[j];
+    }
+    // X(tau) = state for tau < d_conv - 1, else x[tau - (d_conv - 1)]
+    auto X = [&](const int64_t tau) -> float {
+        if (tau < d_conv - 1) {
+            return ((const float *) (state + c * st_nb1 + s * st_nb2))[tau];
+        }
+        return *(const float *) (x + (tau - (d_conv - 1)) * x_nb0 + c * x_nb1 + s * x_nb2);
+    };
+    float win[d_conv];
+#pragma unroll
+    for (int j = 0; j < d_conv - 1; j++) {
+        win[j] = X(t0 + j);
+    }
+    for (int64_t t = t0; t < t1; t++) {
+        win[d_conv - 1] = X(t + d_conv - 1);
+        float sum = 0.0f;
+#pragma unroll
+        for (int j = 0; j < d_conv; j++) {
+            sum += win[j] * wc[j];
+        }
+        *(float *) (dst + t * d_nb1 + s * d_nb2 + c * sizeof(float)) = ggml_cuda_op_silu_single(sum);
+#pragma unroll
+        for (int j = 0; j < d_conv - 1; j++) {
+            win[j] = win[j + 1];
+        }
+    }
+}
+
+bool ggml_cuda_ssm_conv_concat_fusable(const ggml_tensor * concat, const ggml_tensor * conv, const ggml_tensor * silu) {
+    const ggml_tensor * state = concat->src[0];
+    const ggml_tensor * x     = concat->src[1];
+    const ggml_tensor * w     = conv->src[1];
+    const int64_t d_conv = w->ne[0];
+    return ggml_get_op_params_i32(concat, 0) == 0 && conv->src[0] == concat && silu->src[0] == conv &&
+        state->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 &&
+        conv->type == GGML_TYPE_F32 && silu->type == GGML_TYPE_F32 &&
+        (d_conv == 3 || d_conv == 4 || d_conv == 5) && state->ne[0] == d_conv - 1 && state->nb[0] == sizeof(float) &&
+        x->nb[1] == sizeof(float) && w->nb[0] == sizeof(float) && silu->nb[0] == sizeof(float) &&
+        state->ne[1] == x->ne[1] && state->ne[2] == x->ne[2] && state->ne[3] == 1 && x->ne[3] == 1 &&
+        ggml_are_same_shape(conv, silu);
+}
+
+void ggml_cuda_op_ssm_conv_concat_silu(ggml_backend_cuda_context & ctx, ggml_tensor * concat, ggml_tensor * conv, ggml_tensor * silu) {
+    const ggml_tensor * state = concat->src[0];
+    const ggml_tensor * x     = concat->src[1];
+    const ggml_tensor * w     = conv->src[1];
+    const int     nr  = (int) x->ne[1];
+    const int64_t n_t = x->ne[0];
+    const int64_t n_s = x->ne[2];
+    const int tile = 32;
+    const int threads = 128;
+    const dim3 blocks((n_t + tile - 1) / tile, (nr + threads - 1) / threads, n_s);
+    GGML_ASSERT(blocks.x <= INT_MAX && n_s <= 65535 && blocks.y <= 65535);
+    cudaStream_t stream = ctx.stream();
+    auto launch = [&](auto DC) {
+        constexpr int dc = decltype(DC)::value;
+        ssm_conv_concat_silu_f32<dc><<<blocks, threads, 0, stream>>>(
+            (const char *) state->data, state->nb[1], state->nb[2],
+            (const char *) x->data, x->nb[0], x->nb[1], x->nb[2],
+            (const char *) w->data, w->nb[1],
+            (char *) silu->data, silu->nb[1], silu->nb[2], nr, n_t, tile);
+    };
+    switch (w->ne[0]) {
+        case 3: launch(std::integral_constant<int, 3>{}); break;
+        case 4: launch(std::integral_constant<int, 4>{}); break;
+        case 5: launch(std::integral_constant<int, 5>{}); break;
+        default: GGML_ABORT("unsupported d_conv");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}

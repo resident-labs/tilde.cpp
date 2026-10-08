@@ -24,7 +24,11 @@ static constexpr int I8_WARPS = 8;
 static constexpr int I8_KSTR  = I8_DQK + 16;       // bytes per key row in shared memory (bank-conflict padding)
 static constexpr int I8_VSTR  = (I8_DV + 8) * 2;   // bytes per value row in shared memory
 static constexpr int I8_STAGE = I8_BK * I8_KSTR + I8_BK * I8_VSTR + I8_BK * (int) sizeof(float);
-static constexpr int I8_SMEM  = 2 * I8_STAGE;
+#ifndef GGML_CUDA_FATTN_I8_STAGES
+#define GGML_CUDA_FATTN_I8_STAGES 2
+#endif
+static constexpr int I8_NSTAGES = GGML_CUDA_FATTN_I8_STAGES; // cp.async pipeline depth (K/V tiles in flight)
+static constexpr int I8_SMEM  = I8_NSTAGES * I8_STAGE;
 
 bool ggml_cuda_flash_attn_ext_i8_applies(int device, const ggml_tensor * dst) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
@@ -166,6 +170,10 @@ static __device__ __forceinline__ void i8_ldmatrix_x4_trans(uint32_t (&r)[4], co
 #endif // AMPERE_MMA_AVAILABLE
 }
 
+static __device__ __forceinline__ float i8_i2f(const int x) {
+    return __int_as_float(x + 0x4B400000) - 12582912.0f; // exact for |x| < 2^22
+}
+
 static __device__ __forceinline__ uint32_t i8_pack_half2(const float lo, const float hi) {
     const half2 h = __floats2half2_rn(lo, hi);
     return *(const uint32_t *) &h;
@@ -251,16 +259,23 @@ static __global__ void __launch_bounds__(I8_WARPS * WARP_SIZE, 1) fattn_i8_main(
         }
     };
 
-    load_tile(0, 0);
-    asm volatile("cp.async.commit_group;");
-
-    for (int kt = 0; kt < n_tiles; kt++) {
-        const int stage = kt % 2;
-        if (kt + 1 < n_tiles) {
-            load_tile(kt + 1, stage ^ 1);
+    // prologue: tiles 0 .. NSTAGES-2 in flight, one commit group each
+#pragma unroll
+    for (int st = 0; st < I8_NSTAGES - 1; st++) {
+        if (st < n_tiles) {
+            load_tile(st, st);
         }
         asm volatile("cp.async.commit_group;");
-        asm volatile("cp.async.wait_group 1;");
+    }
+
+    for (int kt = 0; kt < n_tiles; kt++) {
+        const int stage = kt % I8_NSTAGES;
+        // the buffer of tile kt + NSTAGES - 1 was last read in iteration kt - 1, which ended with a barrier
+        if (kt + I8_NSTAGES - 1 < n_tiles) {
+            load_tile(kt + I8_NSTAGES - 1, (kt + I8_NSTAGES - 1) % I8_NSTAGES);
+        }
+        asm volatile("cp.async.commit_group;");
+        asm volatile("cp.async.wait_group %0;" : : "n"(I8_NSTAGES - 1));
         __syncthreads();
 
         const char  * sK = smem + stage * I8_STAGE;
@@ -279,7 +294,9 @@ static __global__ void __launch_bounds__(I8_WARPS * WARP_SIZE, 1) fattn_i8_main(
             }
         }
 
-        // rescale, mask keys past the end, online softmax (exp2 domain)
+        // rescale, mask keys past the end, online softmax (exp2 domain). The scores are kept in units of the query
+        // scale (s' = c * sk, s = s' * sq with sq > 0), which moves sq into the exponent's FMA. int32 -> float by an
+        // integer add and a float subtraction (exact: |c| <= 192 * 127 * 127 < 2^22) instead of the quarter-rate I2F.
         float s[I8_BK / 8][4];
         float mt0 = -INFINITY, mt1 = -INFINITY;
 #pragma unroll
@@ -289,10 +306,10 @@ static __global__ void __launch_bounds__(I8_WARPS * WARP_SIZE, 1) fattn_i8_main(
             const float skb = sS[j + 1];
             const bool va = k0 + j < n_kv;
             const bool vb = k0 + j + 1 < n_kv;
-            s[nt][0] = va ? (float) c[nt][0] * sq0 * ska : -INFINITY;
-            s[nt][1] = vb ? (float) c[nt][1] * sq0 * skb : -INFINITY;
-            s[nt][2] = va ? (float) c[nt][2] * sq1 * ska : -INFINITY;
-            s[nt][3] = vb ? (float) c[nt][3] * sq1 * skb : -INFINITY;
+            s[nt][0] = va ? i8_i2f(c[nt][0]) * ska : -INFINITY;
+            s[nt][1] = vb ? i8_i2f(c[nt][1]) * skb : -INFINITY;
+            s[nt][2] = va ? i8_i2f(c[nt][2]) * ska : -INFINITY;
+            s[nt][3] = vb ? i8_i2f(c[nt][3]) * skb : -INFINITY;
             mt0 = fmaxf(mt0, fmaxf(s[nt][0], s[nt][1]));
             mt1 = fmaxf(mt1, fmaxf(s[nt][2], s[nt][3]));
         }
@@ -300,26 +317,29 @@ static __global__ void __launch_bounds__(I8_WARPS * WARP_SIZE, 1) fattn_i8_main(
         mt0 = fmaxf(mt0, __shfl_xor_sync(0xFFFFFFFF, mt0, 2));
         mt1 = fmaxf(mt1, __shfl_xor_sync(0xFFFFFFFF, mt1, 1));
         mt1 = fmaxf(mt1, __shfl_xor_sync(0xFFFFFFFF, mt1, 2));
-        const float mn0 = fmaxf(m0, mt0);
-        const float mn1 = fmaxf(m1, mt1);
+        const float mn0 = fmaxf(m0, mt0 * sq0);
+        const float mn1 = fmaxf(m1, mt1 * sq1);
         const float a0 = exp2f(m0 - mn0);
         const float a1 = exp2f(m1 - mn1);
         m0 = mn0;
         m1 = mn1;
         l0 *= a0;
         l1 *= a1;
+        // the running maxima rarely change after the first tiles: skip the rescale when no row of the warp moved
+        if (__any_sync(0xFFFFFFFF, a0 != 1.0f || a1 != 1.0f)) {
 #pragma unroll
-        for (int nt = 0; nt < I8_DV / 8; nt++) {
-            O[nt][0] *= a0; O[nt][1] *= a0;
-            O[nt][2] *= a1; O[nt][3] *= a1;
+            for (int nt = 0; nt < I8_DV / 8; nt++) {
+                O[nt][0] *= a0; O[nt][1] *= a0;
+                O[nt][2] *= a1; O[nt][3] *= a1;
+            }
         }
         uint32_t p[I8_BK / 8][2];
 #pragma unroll
         for (int nt = 0; nt < I8_BK / 8; nt++) {
-            const float p0 = exp2f(s[nt][0] - mn0);
-            const float p1 = exp2f(s[nt][1] - mn0);
-            const float p2 = exp2f(s[nt][2] - mn1);
-            const float p3 = exp2f(s[nt][3] - mn1);
+            const float p0 = exp2f(fmaf(s[nt][0], sq0, -mn0));
+            const float p1 = exp2f(fmaf(s[nt][1], sq0, -mn0));
+            const float p2 = exp2f(fmaf(s[nt][2], sq1, -mn1));
+            const float p3 = exp2f(fmaf(s[nt][3], sq1, -mn1));
             l0 += p0 + p1;
             l1 += p2 + p3;
             p[nt][0] = i8_pack_half2(p0, p1);

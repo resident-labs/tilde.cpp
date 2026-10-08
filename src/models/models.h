@@ -1984,12 +1984,23 @@ struct llama_model_tilde : public llama_model_bailingmoe3 {
 
     class input_decision;
 
+    // I8 weights (CUDA int8 GEMM preset): the scale of each output row, by weight
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> row_scales;
+
+    // the scale of an I8 weight, nullptr for any other weight
+    ggml_tensor * row_scale(const ggml_tensor * w) const {
+        auto it = w ? row_scales.find(w) : row_scales.end();
+        return it == row_scales.end() ? nullptr : it->second;
+    }
+
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
 
         const llama_model_tilde & model;
 
     private:
+        // w x, with the row scales of I8 weights applied (fused into the GEMM by the CUDA backend)
+        ggml_tensor * mm(ggml_tensor * w, ggml_tensor * x);
         ggml_tensor * build_layer_kda(ggml_tensor * cur, int il);
         ggml_tensor * build_layer_mla(ggml_tensor * cur, ggml_tensor * inp_pos, int il);
         ggml_tensor * build_head(ggml_tensor * hidden, input_decision * inp);

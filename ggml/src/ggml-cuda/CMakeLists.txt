@@ -195,6 +195,17 @@ if (CUDAToolkit_FOUND)
 
     set(CUDA_FLAGS -use_fast_math -extended-lambda)
 
+    # int8 tensor-core GEMM for I8 weights with per-row scales (mmi8.cu), built when a CUTLASS checkout is given
+    set(GGML_CUDA_CUTLASS_DIR "" CACHE PATH "ggml: CUTLASS source directory (enables the CUDA int8 GEMM for I8 weights)")
+    if (GGML_CUDA_CUTLASS_DIR)
+        if (NOT EXISTS ${GGML_CUDA_CUTLASS_DIR}/include/cutlass/cutlass.h)
+            message(FATAL_ERROR "GGML_CUDA_CUTLASS_DIR=${GGML_CUDA_CUTLASS_DIR} has no include/cutlass/cutlass.h")
+        endif()
+        target_include_directories(ggml-cuda PRIVATE ${GGML_CUDA_CUTLASS_DIR}/include)
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_USE_CUTLASS)
+        list(APPEND CUDA_FLAGS --expt-relaxed-constexpr)
+    endif()
+
     if (GGML_CUDA_DEBUG)
         list(APPEND CUDA_FLAGS -lineinfo)
         add_compile_definitions(GGML_CUDA_DEBUG)

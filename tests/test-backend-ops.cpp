@@ -4716,9 +4716,10 @@ struct test_gated_delta_net : public test_case {
     const bool    permuted;
     const bool    kda;
     const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
+    const float   g_min; // gates are drawn from [g_min, -1e-4]; a small |g_min| keeps the state alive across chunks
 
     std::string vars() override {
-        return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
+        return VARS_TO_STR10(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, g_min);
     }
 
     double max_nmse_err() override {
@@ -4728,9 +4729,9 @@ struct test_gated_delta_net : public test_case {
 
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
-            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
+            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, float g_min = -20.0f)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
-          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K) {}
+          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), g_min(g_min) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q;
@@ -4767,7 +4768,7 @@ struct test_gated_delta_net : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) { continue; }
             if (strcmp(t->name, "g") == 0) {
-                init_tensor_uniform(t, -20.0f, -1e-4f);
+                init_tensor_uniform(t, g_min, -1e-4f);
             } else if (strcmp(t->name, "beta") == 0) {
                 init_tensor_uniform(t, 0.0f, 1.0f);
             } else if (strcmp(t->name, "v") == 0) {
@@ -4794,6 +4795,98 @@ struct test_concat_transposed : public test_case {
         ggml_tensor * state = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_state, n_channels, n_seqs);
         ggml_tensor * x     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_channels, n_tokens, n_seqs);
         return ggml_concat(ctx, state, ggml_transpose(ctx, x), 0);
+    }
+};
+
+// MUL_MAT with I8 (integer-valued) weights and a per-row scale MUL (CUDA: int8 tensor cores, scales in the epilogue)
+struct test_mul_mat_i8 : public test_case {
+    const int64_t m, n, k;
+    const bool scaled;
+
+    std::string vars() override {
+        return VARS_TO_STR4(m, n, k, scaled);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4; // per-token int8 activations
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * n * k;
+    }
+
+    test_mul_mat_i8(int64_t m = 64, int64_t n = 70, int64_t k = 256, bool scaled = true) : m(m), n(n), k(k), scaled(scaled) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, k, m);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        if (scaled) {
+            ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+            ggml_set_name(s, "s");
+            out = ggml_mul(ctx, out, s);
+        }
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I8) {
+                std::uniform_int_distribution<int> d(-127, 127);
+                std::vector<int8_t> v(ggml_nelements(t));
+                for (auto & x : v) {
+                    x = (int8_t) d(rng);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size());
+            } else if (strcmp(t->name, "s") == 0) {
+                init_tensor_uniform(t, 0.001f, 0.01f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// ADD -> MUL -> SIGMOID -> SCALE with broadcast operands (fused on CUDA: the KDA decay gate)
+struct test_add_mul_sigmoid_scale : public test_case {
+    const std::array<int64_t, 4> ne, ne_b, ne_m;
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, ne_b, ne_m);
+    }
+
+    test_add_mul_sigmoid_scale(std::array<int64_t, 4> ne = {128, 16, 70, 1}, std::array<int64_t, 4> ne_b = {128, 16, 1, 1},
+            std::array<int64_t, 4> ne_m = {1, 16, 1, 1})
+        : ne(ne), ne_b(ne_b), ne_m(ne_m) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_b.data());
+        ggml_tensor * m = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_m.data());
+        return ggml_scale(ctx, ggml_sigmoid(ctx, ggml_mul(ctx, ggml_add(ctx, x, b), m)), -5.0f);
+    }
+};
+
+// CONCAT(state, transpose(x)) -> SSM_CONV -> SILU (fused on CUDA: the causal conv of linear-attention prefill)
+struct test_ssm_conv_concat : public test_case {
+    const int64_t d_conv, n_channels, n_tokens, n_seqs;
+
+    std::string vars() override {
+        return VARS_TO_STR4(d_conv, n_channels, n_tokens, n_seqs);
+    }
+
+    test_ssm_conv_concat(int64_t d_conv = 4, int64_t n_channels = 256, int64_t n_tokens = 70, int64_t n_seqs = 1)
+        : d_conv(d_conv), n_channels(n_channels), n_tokens(n_tokens), n_seqs(n_seqs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * state = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv - 1, n_channels, n_seqs);
+        ggml_tensor * x     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_channels, n_tokens, n_seqs);
+        ggml_tensor * w     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, n_channels);
+        ggml_tensor * cx    = ggml_concat(ctx, state, ggml_transpose(ctx, x), 0);
+        return ggml_silu(ctx, ggml_ssm_conv(ctx, cx, w));
     }
 };
 
@@ -11648,6 +11741,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  200, 2, 1, true,  true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 2, 128, 9000, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 2, 128, 4100, 1));
+    test_cases.emplace_back(new test_mul_mat_i8());
+    test_cases.emplace_back(new test_mul_mat_i8(64, 70, 256, false));
+    test_cases.emplace_back(new test_mul_mat_i8(1024, 333, 1536));
+    test_cases.emplace_back(new test_mul_mat_i8(2048, 4100, 512));
+    test_cases.emplace_back(new test_add_mul_sigmoid_scale());
+    test_cases.emplace_back(new test_add_mul_sigmoid_scale({128, 16, 333, 2}, {128, 1, 1, 1}, {1, 16, 1, 2}));
+    for (int64_t dc : {3, 4}) {
+        test_cases.emplace_back(new test_ssm_conv_concat(dc, 256, 70, 1));
+        test_cases.emplace_back(new test_ssm_conv_concat(dc, 384, 33, 2));
+    }
+    test_cases.emplace_back(new test_ssm_conv_concat(4, 2048, 5000, 1));
+    // slow decay: the state carries across chunks and segments
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 2, 128, 4200, 2, 1, false, true,  1, -0.05f));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  301, 1, 2, true,  false, 1, -0.05f));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 2, 128, 8300, 1, 1, false, false, 1, -0.02f));
     // chunked path: multi-chunk and non-multiple-of-chunk-size (chunk_size=64 GDN, 16 KDA)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 127, 1));
@@ -11726,10 +11834,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // KDA prefill (Ling-3.0 / Tilde shapes)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 32768, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  4096, 1, 1, false, true));
+    test_cases.emplace_back(new test_mul_mat_i8(2048, 32768, 1536));
     // Tilde / Ling-3.0-tiny matmuls at a 32k prefill: a dense projection, the MoE gate_up and down (8192-token chunks)
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048, 32768, 1536, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 8, false, 1024, 8192, 1536));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 8, false, 1536, 8192, 512));
+    for (int64_t n : {2048, 16384, 32768}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 8, false, 1024, n, 1536));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 8, false, 1536, n, 512));
+    }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 128, 8, false, 1024, 8192, 1536));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands

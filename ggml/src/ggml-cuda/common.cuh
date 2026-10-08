@@ -1448,6 +1448,19 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
+    // int8 GEMM (mmi8.cu): the last per-token int8 activations, reused by the next I8 MUL_MATs of the same graph that
+    // read the same tensor before anything overwrites it (e.g. the q/k/v/gate projections of one input)
+    struct {
+        const ggml_cgraph * graph = nullptr;
+        const ggml_tensor * src   = nullptr;
+        int     valid_until = -1;
+        int8_t * q      = nullptr;
+        float  * s      = nullptr;
+        size_t   q_size = 0;
+        size_t   s_size = 0;
+        std::vector<void *> retired; // outgrown buffers, kept until the context is destroyed (captured CUDA graphs may use them)
+    } i8_act;
+
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};

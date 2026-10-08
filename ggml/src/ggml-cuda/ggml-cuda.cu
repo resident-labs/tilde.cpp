@@ -49,6 +49,8 @@
 #include "ggml-cuda/softcap.cuh"
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
+#include "ggml-cuda/add-mul-sigmoid.cuh"
+#include "ggml-cuda/mmi8.cuh"
 #include "ggml-cuda/ssm-scan.cuh"
 #include "ggml-cuda/sum.cuh"
 #include "ggml-cuda/sumrows.cuh"
@@ -696,6 +698,15 @@ static std::atomic<int> ggml_cuda_lock_counter;
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+
+    if (i8_act.q != nullptr || i8_act.s != nullptr || !i8_act.retired.empty()) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(i8_act.q));
+        CUDA_CHECK(cudaFree(i8_act.s));
+        for (void * p : i8_act.retired) {
+            CUDA_CHECK(cudaFree(p));
+        }
+    }
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
@@ -1907,6 +1918,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     GGML_TENSOR_BINARY_OP_LOCALS
 
     if (ggml_cuda_op_mul_mat_use_fwht(dst) && ggml_cuda_op_fwht(ctx, src1, dst)) {
+        return;
+    }
+
+    if (src0->type == GGML_TYPE_I8) {
+        ggml_cuda_mul_mat_i8(ctx, src0, src1, dst, /*w_scale =*/ nullptr, dst, /*cgraph =*/ nullptr, -1);
         return;
     }
 
@@ -3539,6 +3555,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // I8 weights: the per-row scale (a MUL by an [ne01] vector) goes into the int8 GEMM epilogue
+    if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_I8 &&
+            ggml_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL }) &&
+            ggml_cuda_mul_mat_i8_scale_fusable(node, cgraph->nodes[i + 1])) {
+        ggml_tensor * mul = cgraph->nodes[i + 1];
+        const ggml_tensor * scale = mul->src[0] == node ? mul->src[1] : mul->src[0];
+        ggml_cuda_mul_mat_i8(*cuda_ctx, node->src[0], node->src[1], node, (const float *) scale->data, mul, cgraph, i);
+        return 1;
+    }
+
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
@@ -4279,6 +4305,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    if (ggml_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_SCALE }) &&
+            ggml_cuda_add_mul_sigmoid_scale_fusable(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3])) {
+        ggml_cuda_op_add_mul_sigmoid_scale(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3]);
+        return 3;
+    }
+
+    // (shapes change along the chain, so the subgraph form of the check: only the SILU output leaves the fused ops)
+    if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_CONCAT, GGML_OP_SSM_CONV, GGML_OP_UNARY }, { i + 2 }) &&
+            ggml_get_unary_op(cgraph->nodes[i + 2]) == GGML_UNARY_OP_SILU &&
+            ggml_cuda_ssm_conv_concat_fusable(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+        ggml_cuda_op_ssm_conv_concat_silu(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
         ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
@@ -4548,6 +4588,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    // the int8 activations kept by mmi8.cu belong to the previous graph evaluation
+    cuda_ctx->i8_act.graph = nullptr;
+    cuda_ctx->i8_act.src   = nullptr;
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -5366,6 +5410,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     }
                 }
 #endif // GGML_USE_MUSA
+                if (a->type == GGML_TYPE_I8) {
+                    return op->op == GGML_OP_MUL_MAT && ggml_cuda_mul_mat_i8_supported(dev_ctx->device, op);
+                }
                 switch (a->type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:

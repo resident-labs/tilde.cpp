@@ -96,6 +96,61 @@ def cmd_subset(args) -> None:
                       "median_tokens": lengths[len(lengths) // 2] if lengths else 0}))
 
 
+def fake_quant(model, mode: str) -> None:
+    """Simulate int8 matmuls in the backbone: per-output-row int8 weights and per-token int8 activations (W8A8, the
+    numerics of a cuBLASLt/CUTLASS int8 GEMM with per-channel x per-token scales). `w8a8_dense` covers every Linear of
+    the backbone (attention, linear attention, shared experts, dense FFN, router excluded); `w8a8_all` adds the routed
+    experts. The decision head, embeddings and output table are untouched."""
+    import torch
+    import torch.nn.functional as F
+
+    def q_tok(x):
+        s = x.abs().amax(-1, keepdim=True).clamp_min(1e-12) / 127
+        return (x / s).round().clamp(-127, 127) * s
+
+    def q_row(w):
+        s = w.abs().amax(-1, keepdim=True).clamp_min(1e-12) / 127
+        return (w / s).round().clamp(-127, 127) * s
+
+    backbone = model.backbone if hasattr(model, "backbone") else model
+    n = 0
+    for name, mod in backbone.named_modules():
+        if isinstance(mod, torch.nn.Linear) and "embed" not in name and "lm_head" not in name and not name.endswith("gate"):
+            w = q_row(mod.weight.data.float()).to(mod.weight.dtype)
+            mod.weight.data.copy_(w)
+            def fwd(x, mod=mod):
+                return F.linear(q_tok(x.float()).to(x.dtype), mod.weight, mod.bias)
+            mod.forward = fwd
+            n += 1
+    print(f"fake-quant: {n} Linear layers", file=sys.stderr)
+    if mode == "w8a8_all":
+        from tilda.ling import experts as ling_experts
+        from tilda.ling import modeling_bailing_moe_v3 as ling_model
+
+        def route(hidden, topk_idx, topk_weight, w_gu, w_down):
+            k = topk_idx.shape[-1]
+            flat = topk_idx.reshape(-1)
+            out = torch.zeros(flat.numel(), w_down.shape[1], device=hidden.device, dtype=torch.float32)
+            src = hidden.float().repeat_interleave(k, 0)
+            inter = w_gu.shape[1] // 2
+            for e in torch.unique(flat).tolist():
+                rows = (flat == e).nonzero().squeeze(1)
+                x = q_tok(src[rows])
+                gu = (x @ q_row(w_gu[e].float()).t()).float()
+                h = F.silu(gu[:, :inter]) * gu[:, inter:]
+                out[rows] = (q_tok(h) @ q_row(w_down[e].float()).t()).float()
+            return (out.view(*topk_weight.shape, -1) * topk_weight.float().unsqueeze(-1)).sum(dim=1)
+
+        ling_model.route = route
+        ling_experts.route = route
+        m = 0
+        for mod in backbone.modules():
+            if hasattr(mod, "expert_backend"):
+                mod.expert_backend = "loop"
+                m += 1
+        print(f"fake-quant: {m} MoE blocks", file=sys.stderr)
+
+
 def cmd_run(args) -> None:
     tilda_path()
     import torch
@@ -110,6 +165,8 @@ def cmd_run(args) -> None:
         model.float()
         if getattr(model, "original_output_embedding", None) is not None:
             model.original_output_embedding.float()
+    if args.fake_quant != "none":
+        fake_quant(model, args.fake_quant)
     records = read_records(args.records, args.limit)
     done = set()
     if args.out.exists():
@@ -250,6 +307,8 @@ def main() -> None:
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--limit", type=int)
     p.add_argument("--fp32", action="store_true", help="run the reference in fp32 (no autocast)")
+    p.add_argument("--fake-quant", choices=("none", "w8a8_dense", "w8a8_all"), default="none",
+                   help="simulate per-channel x per-token int8 matmuls in the backbone (see fake_quant)")
     p = sub.add_parser("compare")
     p.add_argument("--records", type=Path, required=True)
     p.add_argument("--ref", type=Path, required=True)

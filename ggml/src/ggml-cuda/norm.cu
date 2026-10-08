@@ -305,8 +305,8 @@ static void group_norm_f32_cuda(
     }
 }
 
-template <bool do_scale = false>
 // rows of at most 128 elements (per-head norms) use 128 threads per row instead of 256, so that no thread idles
+template <bool do_scale = false>
 static void rms_norm_f32_cuda(
         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream,

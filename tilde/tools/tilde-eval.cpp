@@ -95,12 +95,12 @@ static bool profile_cb(struct ggml_tensor * t, bool ask, void * user_data) {
 static void usage(const char * argv0) {
     fprintf(stderr,
         "usage: %s -m MODEL.gguf --records IN.jsonl --out OUT.jsonl [-ngl N] [-t THREADS] [-fa on|off|auto]\n"
-        "          [--max-tokens N] [--limit N] [--repeat N] [--profile]\n", argv0);
+        "          [--max-tokens N] [--limit N] [--repeat N] [--profile] [--experts N]\n", argv0);
 }
 
 int main(int argc, char ** argv) {
     std::string model_path, records_path, out_path, fa = "auto";
-    int ngl = 999, threads = -1, max_tokens = 0, limit = -1, repeat = 1;
+    int ngl = 999, threads = -1, max_tokens = 0, limit = -1, repeat = 1, experts = 0;
     bool do_profile = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -118,6 +118,7 @@ int main(int argc, char ** argv) {
         else if (a == "--limit") limit = std::stoi(next());
         else if (a == "--repeat") repeat = std::stoi(next());
         else if (a == "--profile") do_profile = true;
+        else if (a == "--experts") experts = std::stoi(next()); // routed experts per token (default: the model's)
         else { usage(argv[0]); return 1; }
     }
     if (model_path.empty() || records_path.empty() || out_path.empty()) {
@@ -144,6 +145,16 @@ int main(int argc, char ** argv) {
 
     auto mparams = llama_model_default_params();
     mparams.n_gpu_layers = ngl;
+    std::vector<llama_model_kv_override> kv_overrides;
+    if (experts > 0) {
+        llama_model_kv_override o = {};
+        o.tag = LLAMA_KV_OVERRIDE_TYPE_INT;
+        snprintf(o.key, sizeof(o.key), "tilde.expert_used_count");
+        o.val_i64 = experts;
+        kv_overrides.push_back(o);
+        kv_overrides.push_back({}); // terminator: empty key
+        mparams.kv_overrides = kv_overrides.data();
+    }
     llama_model_ptr model(llama_model_load_from_file(model_path.c_str(), mparams));
     if (!model) {
         fprintf(stderr, "failed to load %s\n", model_path.c_str());

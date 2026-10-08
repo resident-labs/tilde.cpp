@@ -1265,6 +1265,30 @@ void ggml_compute_forward_mul_mat(
         return;
     }
 
+    if (src0->type == GGML_TYPE_I8) {
+        // integer-valued weights (the per-row scales are applied by the graph): plain f32 dot products, one output
+        // row (weight row) per thread at a time
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && src0->nb[0] == 1 && src1->nb[0] == sizeof(float));
+        GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1);
+        const int64_t K = src0->ne[0], M = src0->ne[1];
+        for (int64_t m = params->ith; m < M; m += params->nth) {
+            const int8_t * w = (const int8_t *) ((const char *) src0->data + m * src0->nb[1]);
+            for (int64_t i3 = 0; i3 < src1->ne[3]; i3++) {
+                for (int64_t i2 = 0; i2 < src1->ne[2]; i2++) {
+                    for (int64_t t = 0; t < src1->ne[1]; t++) {
+                        const float * x = (const float *) ((const char *) src1->data + t * src1->nb[1] + i2 * src1->nb[2] + i3 * src1->nb[3]);
+                        float sum = 0.0f;
+                        for (int64_t k = 0; k < K; k++) {
+                            sum += (float) w[k] * x[k];
+                        }
+                        *(float *) ((char *) dst->data + m * dst->nb[0] + t * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3]) = sum;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     // If tiled is supported, it will execute the full op here and we return
     if (ggml_compute_forward_mul_mat_tiled(params, dst)) {
         return;

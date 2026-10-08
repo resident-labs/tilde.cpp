@@ -107,6 +107,47 @@ void llama_model_tilde::load_arch_tensors(llama_model_loader & ml) {
         }
     }
 
+    // I8 weights carry one f32 scale per output row, `<name>.scale` (tilde/make_i8c.py)
+    auto load_scale = [&](ggml_tensor * w, llm_tensor kind, int il) {
+        if (w != nullptr && w->type == GGML_TYPE_I8) {
+            row_scales[w] = create_tensor(tn(kind, "scale", il), { w->ne[1] }, 0);
+        }
+    };
+    for (int il = 0; il < n_layer; ++il) {
+        auto & layer = layers[il];
+        load_scale(layer.wq,             LLM_TENSOR_ATTN_Q,         il);
+        load_scale(layer.wk,             LLM_TENSOR_ATTN_K,         il);
+        load_scale(layer.wv,             LLM_TENSOR_ATTN_V,         il);
+        load_scale(layer.wo,             LLM_TENSOR_ATTN_OUT,       il);
+        load_scale(layer.ssm_f_a,        LLM_TENSOR_SSM_F_A,        il);
+        load_scale(layer.ssm_g_a,        LLM_TENSOR_SSM_G_A,        il);
+        load_scale(layer.ssm_beta,       LLM_TENSOR_SSM_BETA,       il);
+        load_scale(layer.wq_a,           LLM_TENSOR_ATTN_Q_A,       il);
+        load_scale(layer.wq_b,           LLM_TENSOR_ATTN_Q_B,       il);
+        load_scale(layer.wkv_a_mqa,      LLM_TENSOR_ATTN_KV_A_MQA,  il);
+        load_scale(layer.wkv_b,          LLM_TENSOR_ATTN_KV_B,      il);
+        load_scale(layer.wqkv_gate,      LLM_TENSOR_ATTN_GATE,      il);
+        load_scale(layer.ffn_gate,       LLM_TENSOR_FFN_GATE,       il);
+        load_scale(layer.ffn_up,         LLM_TENSOR_FFN_UP,         il);
+        load_scale(layer.ffn_down,       LLM_TENSOR_FFN_DOWN,       il);
+        load_scale(layer.ffn_gate_shexp, LLM_TENSOR_FFN_GATE_SHEXP, il);
+        load_scale(layer.ffn_up_shexp,   LLM_TENSOR_FFN_UP_SHEXP,   il);
+        load_scale(layer.ffn_down_shexp, LLM_TENSOR_FFN_DOWN_SHEXP, il);
+        // the generic per-tensor scale pass of llama_model must not create these names again
+        layer.wq_s             = row_scale(layer.wq);
+        layer.wk_s             = row_scale(layer.wk);
+        layer.wv_s             = row_scale(layer.wv);
+        layer.wo_s             = row_scale(layer.wo);
+        layer.wqkv_gate_s      = row_scale(layer.wqkv_gate);
+        layer.ssm_beta_s       = row_scale(layer.ssm_beta);
+        layer.ffn_gate_s       = row_scale(layer.ffn_gate);
+        layer.ffn_up_s         = row_scale(layer.ffn_up);
+        layer.ffn_down_s       = row_scale(layer.ffn_down);
+        layer.ffn_gate_shexp_s = row_scale(layer.ffn_gate_shexp);
+        layer.ffn_up_shexp_s   = row_scale(layer.ffn_up_shexp);
+        layer.ffn_down_shexp_s = row_scale(layer.ffn_down_shexp);
+    }
+
     // decision head (same tensors as clef)
     const auto * w_memory = ml.get_weight(tn(LLM_TENSOR_DECISION_PROJ_MEMORY, "weight").str().c_str());
     const auto * w_ffn    = ml.get_weight(tn(LLM_TENSOR_DEC_FFN_UP, "weight", 0).str().c_str());
@@ -484,9 +525,9 @@ llama_model_tilde::graph::graph(const llama_model & model_base, const llm_graph_
         if ((uint32_t) il < hparams.n_layer_dense_lead) {
             cur = tilde_chunked(ctx0, cur, tilde_chunk_tokens(), [&](ggml_tensor * x) {
                 return build_ffn(x,
-                    layer.ffn_up,   nullptr, nullptr,
-                    layer.ffn_gate, nullptr, nullptr,
-                    layer.ffn_down, nullptr, nullptr,
+                    layer.ffn_up,   nullptr, model.row_scale(layer.ffn_up),
+                    layer.ffn_gate, nullptr, model.row_scale(layer.ffn_gate),
+                    layer.ffn_down, nullptr, model.row_scale(layer.ffn_down),
                     nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
             });
         } else {
@@ -504,9 +545,9 @@ llama_model_tilde::graph::graph(const llama_model & model_base, const llm_graph_
                     (llama_expert_gating_func_type) hparams.expert_gating_func,
                     il, nullptr, layer.ffn_gate_up_exps);
             ggml_tensor * shared = build_ffn(cur,
-                    layer.ffn_up_shexp,   nullptr, nullptr,
-                    layer.ffn_gate_shexp, nullptr, nullptr,
-                    layer.ffn_down_shexp, nullptr, nullptr,
+                    layer.ffn_up_shexp,   nullptr, model.row_scale(layer.ffn_up_shexp),
+                    layer.ffn_gate_shexp, nullptr, model.row_scale(layer.ffn_gate_shexp),
+                    layer.ffn_down_shexp, nullptr, model.row_scale(layer.ffn_down_shexp),
                     nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
             return ggml_add(ctx0, moe, shared);
             });
@@ -536,6 +577,14 @@ llama_model_tilde::graph::graph(const llama_model & model_base, const llm_graph_
     ggml_build_forward_expand(gf, cur);
 }
 
+ggml_tensor * llama_model_tilde::graph::mm(ggml_tensor * w, ggml_tensor * x) {
+    ggml_tensor * res = ggml_mul_mat(ctx0, w, x);
+    if (ggml_tensor * s = model.row_scale(w)) {
+        res = ggml_mul(ctx0, res, s);
+    }
+    return res;
+}
+
 // KDA layer over the whole batch: causal, the conv and recurrent states start from zero and are not kept
 ggml_tensor * llama_model_tilde::graph::build_layer_kda(ggml_tensor * cur, int il) {
     const auto & layer = model.layers[il];
@@ -547,12 +596,15 @@ ggml_tensor * llama_model_tilde::graph::build_layer_kda(ggml_tensor * cur, int i
     const int64_t n_seqs   = 1;
 
     auto conv = [&](ggml_tensor * proj_w, ggml_tensor * conv_w) {
-        ggml_tensor * x = ggml_mul_mat(ctx0, proj_w, cur);
+        ggml_tensor * x = mm(proj_w, cur);
         x = ggml_reshape_3d(ctx0, x, d_inner, n_tokens, n_seqs);
+        // the conv weight view is expanded first, so that CONCAT, SSM_CONV and SILU are adjacent graph nodes and the
+        // backends can fuse them (silu directly on the conv output)
+        ggml_tensor * cw     = ggml_reshape_2d(ctx0, conv_w, d_conv, d_inner);
+        ggml_build_forward_expand(gf, cw);
         ggml_tensor * zeros  = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, d_conv - 1, d_inner, n_seqs), 0.0f);
         ggml_tensor * conv_x = ggml_concat(ctx0, zeros, ggml_transpose(ctx0, x), 0);
-        // silu directly on the conv output, so that the backends can fuse the two
-        ggml_tensor * out    = ggml_silu(ctx0, ggml_ssm_conv(ctx0, conv_x, ggml_reshape_2d(ctx0, conv_w, d_conv, d_inner)));
+        ggml_tensor * out    = ggml_silu(ctx0, ggml_ssm_conv(ctx0, conv_x, cw));
         return ggml_reshape_4d(ctx0, out, head_dim, n_head, n_tokens, n_seqs);
     };
 
@@ -560,16 +612,19 @@ ggml_tensor * llama_model_tilde::graph::build_layer_kda(ggml_tensor * cur, int i
     ggml_tensor * k = conv(layer.wk, layer.ssm_k_conv);
     ggml_tensor * v = conv(layer.wv, layer.ssm_v_conv);
 
-    // safe gate: lower_bound * sigmoid(exp(A_log) * (f_proj(x) + dt_bias))
-    ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ssm_f_a, cur);
-    gate = ggml_add(ctx0, gate, layer.ssm_dt_b);
-    gate = ggml_reshape_3d(ctx0, gate, head_dim, n_head, n_tokens);
-    ggml_tensor * a = ggml_reshape_3d(ctx0, layer.ssm_a, 1, n_head, 1);
+    // safe gate: lower_bound * sigmoid(exp(A_log) * (f_proj(x) + dt_bias)). The broadcast operands are expanded first,
+    // so that ADD, MUL, SIGMOID and SCALE are adjacent graph nodes (one fused pass on CUDA)
+    ggml_tensor * dt_b = ggml_reshape_3d(ctx0, layer.ssm_dt_b, head_dim, n_head, 1);
+    ggml_tensor * a    = ggml_reshape_3d(ctx0, layer.ssm_a, 1, n_head, 1);
+    ggml_build_forward_expand(gf, dt_b);
+    ggml_build_forward_expand(gf, a);
+    ggml_tensor * gate = ggml_reshape_3d(ctx0, mm(layer.ssm_f_a, cur), head_dim, n_head, n_tokens);
+    gate = ggml_add(ctx0, gate, dt_b);
     gate = ggml_scale(ctx0, ggml_sigmoid(ctx0, ggml_mul(ctx0, gate, a)), hparams.kda_gate_lower_bound);
     gate = ggml_reshape_4d(ctx0, gate, head_dim, n_head, n_tokens, n_seqs);
     cb(gate, "kda_gate", il);
 
-    ggml_tensor * beta = ggml_mul_mat(ctx0, layer.ssm_beta, cur);
+    ggml_tensor * beta = mm(layer.ssm_beta, cur);
     beta = ggml_sigmoid(ctx0, ggml_reshape_4d(ctx0, beta, 1, n_head, n_tokens, n_seqs));
 
     // the norms run on [head_dim, n_head * n_tokens]: a [head_dim, n_head, n_tokens] launch puts n_tokens in a grid
@@ -584,13 +639,13 @@ ggml_tensor * llama_model_tilde::graph::build_layer_kda(ggml_tensor * cur, int i
     ggml_tensor * out = build_delta_net(q, k, v, gate, beta, state, il).first;
     cb(out, "kda_attn", il);
 
-    ggml_tensor * out_gate = ggml_mul_mat(ctx0, layer.ssm_g_a, cur);
+    ggml_tensor * out_gate = mm(layer.ssm_g_a, cur);
     out_gate = ggml_reshape_3d(ctx0, out_gate, head_dim, n_head, n_tokens);
     out = ggml_reshape_2d(ctx0, ggml_is_contiguous(out) ? out : ggml_cont(ctx0, out), head_dim, n_head * n_tokens);
     out = build_norm(out, layer.ssm_o_norm, nullptr, LLM_NORM_RMS, il);
     out = ggml_reshape_3d(ctx0, out, head_dim, n_head, n_tokens);
     out = ggml_mul(ctx0, out, ggml_sigmoid(ctx0, out_gate));
-    cur = ggml_mul_mat(ctx0, layer.wo, ggml_reshape_2d(ctx0, out, d_inner, n_tokens));
+    cur = mm(layer.wo, ggml_reshape_2d(ctx0, out, d_inner, n_tokens));
     cb(cur, "kda_out", il);
 
     return cur;
@@ -613,11 +668,11 @@ ggml_tensor * llama_model_tilde::graph::build_layer_mla(ggml_tensor * cur, ggml_
 
     ggml_tensor * q_all;
     if (layer.wq_a) {
-        q_all = ggml_mul_mat(ctx0, layer.wq_a, cur);
+        q_all = mm(layer.wq_a, cur);
         q_all = build_norm(q_all, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
-        q_all = ggml_mul_mat(ctx0, layer.wq_b, q_all);
+        q_all = mm(layer.wq_b, q_all);
     } else {
-        q_all = ggml_mul_mat(ctx0, layer.wq, cur);
+        q_all = mm(layer.wq, cur);
     }
     cb(q_all, "q", il);
 
@@ -629,7 +684,7 @@ ggml_tensor * llama_model_tilde::graph::build_layer_mla(ggml_tensor * cur, ggml_
             ggml_row_size(q_all->type, qk_head_dim) * n_head,
             ggml_row_size(q_all->type, qk_nope_head_dim));
 
-    ggml_tensor * kv_all = ggml_mul_mat(ctx0, layer.wkv_a_mqa, cur);
+    ggml_tensor * kv_all = mm(layer.wkv_a_mqa, cur);
     ggml_tensor * kv = ggml_view_2d(ctx0, kv_all, kv_lora_rank, n_tokens,
             ggml_row_size(kv_all->type, kv_lora_rank + qk_rope_head_dim), 0);
     ggml_tensor * k_pe = ggml_view_3d(ctx0, kv_all, qk_rope_head_dim, 1, n_tokens,
@@ -645,7 +700,7 @@ ggml_tensor * llama_model_tilde::graph::build_layer_mla(ggml_tensor * cur, ggml_
     kv = build_norm(kv, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
 
     // [n_head * (qk_nope + v), n_tokens]: per head, K nope rows then V rows
-    ggml_tensor * kvb = ggml_mul_mat(ctx0, layer.wkv_b, kv);
+    ggml_tensor * kvb = mm(layer.wkv_b, kv);
     cb(kvb, "kv_b", il);
     const size_t es = ggml_element_size(kvb);
     ggml_tensor * k_nope = ggml_view_3d(ctx0, kvb, qk_nope_head_dim, n_head, n_tokens,
@@ -688,11 +743,11 @@ ggml_tensor * llama_model_tilde::graph::build_layer_mla(ggml_tensor * cur, ggml_
     }
     cb(cur, "mla_attn", il);
 
-    ggml_tensor * attn_gate = ggml_mul_mat(ctx0, layer.wqkv_gate, attn_input);
+    ggml_tensor * attn_gate = mm(layer.wqkv_gate, attn_input);
     attn_gate = ggml_sigmoid(ctx0, ggml_reshape_3d(ctx0, attn_gate, 1, n_head, n_tokens));
     cur = ggml_reshape_3d(ctx0, cur, v_head_dim, n_head, n_tokens);
     cur = ggml_mul(ctx0, cur, attn_gate);
-    cur = ggml_mul_mat(ctx0, layer.wo, ggml_reshape_2d(ctx0, cur, v_head_dim * n_head, n_tokens));
+    cur = mm(layer.wo, ggml_reshape_2d(ctx0, cur, v_head_dim * n_head, n_tokens));
     cb(cur, "mla_out", il);
 
     return cur;
