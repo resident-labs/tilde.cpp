@@ -559,7 +559,7 @@ bool ggml_cuda_mul_mat_id_i8_supported(int device, const ggml_tensor * dst) {
 
 void ggml_cuda_mul_mat_id_i8(ggml_backend_cuda_context & ctx, const ggml_tensor * mmid, const float * w_scale, ggml_tensor * out,
         mmid_i8_epilogue epilogue, const ggml_tensor * weights, const ggml_cgraph * cgraph, int node_idx,
-        const ggml_tensor * add1, const ggml_tensor * add2) {
+        const ggml_tensor * add1, const ggml_tensor * add2, bool glu_q8_allowed) {
 #ifdef GGML_CUDA_USE_CUTLASS
     const ggml_tensor * src0 = mmid->src[0];
     const ggml_tensor * src1 = mmid->src[1];
@@ -683,7 +683,7 @@ void ggml_cuda_mul_mat_id_i8(ggml_backend_cuda_context & ctx, const ggml_tensor 
                 (float *) out->data, E, N, out->nb[1]);
         } break;
         case MMID_I8_SWIGLU: {
-            if (mmid_i8_glu_direct(ctx.device, cgraph, node_idx + 3, mmid) && cgraph->nodes[node_idx + 3] == out) {
+            if (glu_q8_allowed && mmid_i8_glu_direct(ctx.device, cgraph, node_idx + 3, mmid) && cgraph->nodes[node_idx + 3] == out) {
                 const int H = N / 2;
                 if ((size_t) (R * H) > gc.q_size || (size_t) R > gc.s_size) {
                     if (gc.q != nullptr) {
@@ -715,7 +715,7 @@ void ggml_cuda_mul_mat_id_i8(ggml_backend_cuda_context & ctx, const ggml_tensor 
     }
     CUDA_CHECK(cudaGetLastError());
 #else
-    GGML_UNUSED_VARS(ctx, mmid, w_scale, out, epilogue, weights, cgraph, node_idx, add1, add2);
+    GGML_UNUSED_VARS(ctx, mmid, w_scale, out, epilogue, weights, cgraph, node_idx, add1, add2, glu_q8_allowed);
     GGML_ABORT("the int8 GEMM needs a build with GGML_CUDA_CUTLASS_DIR");
 #endif // GGML_CUDA_USE_CUTLASS
 }

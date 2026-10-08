@@ -2000,7 +2000,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (src0->type == GGML_TYPE_F32 && ggml_get_op_params_i32(dst, 2) >= GGML_PREC_F16 &&
             ggml_get_op_params_i32(dst, 3) >= GGML_PREC_F16 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA &&
             ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 && nb00 == sizeof(float) && nb10 == sizeof(float) &&
-            ggml_is_contiguous(dst) && ne11 >= 256) {
+            src1->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) && ne11 >= 256) {
+        // note: F16 operands also mean the F16 exponent range (|x| up to 65504); the hint is for products whose inputs
+        // are normalized activations and trained weights (the Tilde head)
         const float alpha = 1.0f, beta = 0.0f;
         cublasHandle_t h = ctx.cublas_handle();
         CUBLAS_CHECK(cublasSetStream(h, ctx.stream()));
@@ -3694,7 +3696,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU && ggml_get_op_params_i32(glu, 1) == 0 &&
                     glu->src[0] == g && glu->src[1] == u && is_half(g, 0) && is_half(u, half * sizeof(float)) &&
                     glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) && half % 4 == 0) {
-                ggml_cuda_mul_mat_id_i8(*cuda_ctx, node, w_scale, glu, MMID_I8_SWIGLU, nullptr, cgraph, i);
+                // the SwiGLU may go straight to int8 rows only when its reader (the down projection) takes the fused
+                // int8 reduction path below, which reads those rows
+                bool glu_q8 = false;
+                for (int j = i + 4; j < cgraph->n_nodes; j++) {
+                    const ggml_tensor * dn = cgraph->nodes[j];
+                    if (dn->src[1] != glu) {
+                        continue;
+                    }
+                    ggml_cuda_moe_weighted_reduction_match dm;
+                    glu_q8 = dn->op == GGML_OP_MUL_MAT_ID && dn->src[0]->type == GGML_TYPE_I8 && j + 1 < cgraph->n_nodes &&
+                        ggml_node_has_n_uses(cgraph, j, 1) && ggml_cuda_mul_mat_id_i8_supported(cuda_ctx->device, dn) &&
+                        ggml_cuda_match_moe_weighted_reduction(cgraph, j + 1, dm) && dm.experts == dn && dm.expert_scale == nullptr;
+                    break;
+                }
+                ggml_cuda_mul_mat_id_i8(*cuda_ctx, node, w_scale, glu, MMID_I8_SWIGLU, nullptr, cgraph, i, nullptr, nullptr, glu_q8);
                 return 3;
             }
         }

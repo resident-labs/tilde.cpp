@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <type_traits>
 #include <cstdlib>
+#include <cstdio>
 
 #include "fattn-sage.cuh"
 
@@ -419,11 +420,19 @@ void ggml_sage_attn(const int8_t * q8, const int8_t * k8, const void * v, int64_
         const float * ks, float * dst, int64_t o_tok, int64_t o_head, int64_t n_q, int64_t n_kv, int64_t H, float sm_scale,
         int * flag, cudaStream_t stream) {
     using namespace ggml_sage;
-    static bool smem_set = false; // per process: the attribute is per function, the same value on every device
-    if (!smem_set) {
+    // the predicated loads leave rows past the end unfilled: with at least one full key tile every unfilled V row
+    // holds finite values of the previous tile (times exactly 0), never the Q staging bytes
+    if (n_kv < (int64_t) CTA_K) {
+        fprintf(stderr, "%s: needs at least %u keys\n", __func__, CTA_K);
+        abort();
+    }
+    static bool smem_set[64] = {};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 64 && !smem_set[dev]) {
         cudaFuncSetAttribute(sage_attn_192_128<half, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) SMEM);
         cudaFuncSetAttribute(sage_attn_192_128<float, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) SMEM);
-        smem_set = true;
+        smem_set[dev] = true;
     }
     const dim3 grid((unsigned) ((n_q + CTA_Q - 1) / CTA_Q), (unsigned) H);
     const dim3 block(WARP_SIZE, num_warps);
