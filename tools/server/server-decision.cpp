@@ -268,8 +268,30 @@ static void decision_load_image(const json & url, std::vector<raw_buffer> & file
 
 json server_decision_context::parse_state(const json & body, std::vector<raw_buffer> & files) const {
     if (type == COMMON_DECISION_TYPE_TILDE) {
-        // tilde reads the state as given (text or JSON, image parts included as text), like tilda/serve.py
-        return body.contains("state") ? body.at("state") : json();
+        // tilde reads the state as given (text or JSON), like tilda/serve.py; media are refused rather than answered
+        // from the text around them
+        static const char * TEXT_ONLY = "this Tilde model is text-only";
+        for (const char * key : { "images", "videos", "audio" }) {
+            if (body.contains(key) && !body.at(key).is_null() && !(body.at(key).is_array() && body.at(key).empty())) {
+                throw std::invalid_argument(string_format("%s: \"%s\" is not supported", TEXT_ONLY, key));
+            }
+        }
+        const json state = body.contains("state") ? body.at("state") : json();
+        const json & messages = state.is_object() && state.contains("messages") ? state.at("messages") : state;
+        if (messages.is_array()) {
+            for (const auto & msg : messages) {
+                if (!msg.is_object() || !msg.contains("content") || !msg.at("content").is_array()) {
+                    continue;
+                }
+                for (const auto & part : msg.at("content")) {
+                    const std::string t = part.is_object() ? json_value(part, "type", std::string()) : std::string();
+                    if (t == "image_url" || t == "image" || t == "input_image" || t == "input_audio" || t == "video_url") {
+                        throw std::invalid_argument(string_format("%s: \"%s\" content is not supported", TEXT_ONLY, t.c_str()));
+                    }
+                }
+            }
+        }
+        return state;
     }
     if (body.contains("videos") && !body.at("videos").is_null() && !body.at("videos").empty()) {
         throw std::invalid_argument("\"videos\" is not supported");
