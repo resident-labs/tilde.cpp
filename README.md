@@ -87,8 +87,8 @@ or `-m <file>`.
 | Q8_0 | `tilde-8b-a1b-Q8_0.gguf` | Q8_0 | Q8_0 | f32 | 9.3 GB | default; GPUs with >= 16 GB, CPUs |
 | Q4_KE | `tilde-8b-a1b-Q4_KE.gguf` | Q4_K | Q8_0 | f32 | 5.8 GB | 8-12 GB GPUs, Macs |
 | I8CX | `tilde-8b-a1b-I8CX.gguf` | int8 + row scales | int8 + row scales (projections), Q8_0 | f32 | 8.9 GB | NVIDIA Ampere or newer with a CUTLASS build: the fastest (1.18 s at 32k on a 3090 Ti with `TILDE_FA_FAST=1`) |
-| NVFP4E | `tilde-8b-a1b-NVFP4E.gguf` | NVFP4 | Q8_0 | f32 | 5.8 GB | Blackwell GPUs (native FP4) |
-| MXFP4E | `tilde-8b-a1b-MXFP4E.gguf` | MXFP4 | Q8_0 | f32 | 5.4 GB | Blackwell GPUs (native FP4) |
+| NVFP4E | `tilde-8b-a1b-NVFP4E.gguf` | NVFP4 | Q8_0 | f32 | 5.8 GB | experimental (on Blackwell's native FP4 it is over the accuracy budget and slower than I8CX) |
+| MXFP4E | `tilde-8b-a1b-MXFP4E.gguf` | MXFP4 | Q8_0 | f32 | 5.4 GB | experimental |
 | BF16 | `tilde-8b-a1b-BF16.gguf` | bf16 | bf16 | f32 | 16.2 GB | reference |
 
 Every preset is gated against the PyTorch reference on DEV data (see "Parity"). The token embeddings stay in host
@@ -113,7 +113,7 @@ STATUS.md has the details). "Not tested" means the code path exists but nobody h
 | NVIDIA, 12 GB | CUDA | Q4_KE | 1,997 ms (3090 Ti capped to 11.5 GiB) | 10.2 GiB |
 | NVIDIA, 8 GB | CUDA | Q4_KE, requests up to 19,456 tokens | 32k rejected; 16k: 866 ms (3090 Ti capped to 7.5 GiB) | 6.8 GiB |
 | NVIDIA Ada (RTX 40), Hopper | CUDA + CUTLASS | I8CX + fast attention | not tested | - |
-| NVIDIA Blackwell (RTX 50) | CUDA 12.8+ + CUTLASS | I8CX + fast attention | not tested (RTX 5090 run packaged) | - |
+| NVIDIA Blackwell, 32 GB (RTX 5090) | CUDA 12.8+ + CUTLASS (arch 120a) | I8CX + fast attention | **640 ms** (tilde-eval: 575 ms) | 14.1 GiB |
 | NVIDIA Turing / Volta (RTX 20, V100) | CUDA | Q8_0, or Q4_KE when memory is short | not tested | - |
 | NVIDIA, CUDA build without CUTLASS | CUDA | Q8_0 / Q4_KE | 1,994 ms (Q8_0 on the 3090 Ti) | 13.4 GiB |
 | any GPU through Vulkan (measured: RTX 3090 Ti) | Vulkan | Q8_0 / Q4_KE | 3,512 ms (older build) | 13.6 GiB |

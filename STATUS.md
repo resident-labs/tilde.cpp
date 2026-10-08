@@ -1,7 +1,7 @@
 # tilde.cpp status
 
-Last updated 2026-10-08 08:15 CDT (commit 64787c69e). Every number below was measured on hermeslab (RTX 3090 Ti 24 GB,
-i7-12700K, CUDA 13.1). Nothing is extrapolated. The RTX 5090 run is packaged (see the end) and not run yet.
+Last updated 2026-10-08 08:45 CDT (commit ab5d070a2). Every number below was measured on hermeslab (RTX 3090 Ti 24 GB,
+i7-12700K, CUDA 13.1) unless marked as the RTX 5090 run. Nothing is extrapolated.
 
 ## Where we are
 
@@ -15,8 +15,9 @@ One 32,768-token request, warm, RTX 3090 Ti:
 | I8CX now (tilde-eval / server) | 1,372 / 1,429 | 1.60x |
 | I8CX+PV8 (tilde-eval / server) | 1,311 / 1,368 | 1.67x |
 | **I8CX+FAST (tilde-eval / server)** | **1,180 / 1,244** | **1.84x** |
+| I8CX+FAST on an RTX 5090 (tilde-eval / server) | 575 / 640 | 3.6x |
 
-The 1,000 ms target is not reached on the 3090 Ti. I8CX+FAST is the fastest configuration inside the accuracy budget
+The 1,000 ms target is reached on the RTX 5090 (575 ms) but not on the 3090 Ti. I8CX+FAST is the fastest configuration inside the accuracy budget
 (1.0 pt, +0.01 log loss) and is the default (Ari, 2026-10-08): `tilde-server` picks it with no flags on NVIDIA Ampere or
 newer with a CUTLASS build and the memory for 65,536-token requests (otherwise Q8_0, or Q4_KE when memory is short),
 logs why, and reports it in `GET /health`; a preset tag, `-m` or `TILDE_FA_FAST=0` override it. The kernel profile and
@@ -149,16 +150,28 @@ History at 32k (tilde-eval, warm): 2,092 (Q8_0, GDN v4) -> 1,911 (I8C) -> 1,642 
 1,530 (v12, int8 P*V) -> 1,384 (cast elision, MoE reduce + residual, warp norms, fused routing) -> 1,311 (head F16, GDN
 f16 temporaries, int8 rows from SwiGLU and norms) -> 1,180 (I8CX+FAST).
 
-## RTX 5090 test (packaged; box rented 08:10, running)
+## RTX 5090 (Vast, Ryzen 9 9950X, CUDA 12.8, arch 120a; run 2026-10-08 08:34 CDT, commit ab5d070a2)
 
-`tilde/bench/run_gpu_box.sh` with everything in the private HF repo `resident-labs/tilde-8b-a1b-GGUF-staging`
-(`src/` tarball of the pushed commit, `gguf/` Q8_0, Q4_KE, I8CX, NVFP4E, `data/` a 400-record public-source DEV slice
-with PyTorch logits, the 1k-64k bench records with PyTorch logits, 3090 Ti results). On a fresh box with the CUDA 12.8+
-toolkit: `HF_TOKEN=... bash run_gpu_box.sh` builds for `120a-real` with CUTLASS 3.9.2, runs the kernel tests, then per
-preset (Q8_0, Q4_KE, I8CX, I8CX+PV8, I8CX+FAST, NVFP4E) the DEV-slice gates, the 1k-64k sweep, peak VRAM and the
-long-request |dp| against PyTorch, and uploads `results/<gpu>-<date>/summary.md`. It drops the token and any cached hf
-credential on exit, and also runs the `tilde-server` default path (no flags) with `/health`. Dry runs on hermeslab
-(arch 86): full package with the 28 GB download from HF 1,180 s; the default-path step 635 s (server 32k 1,250 ms).
+`tilde/bench/run_gpu_box.sh` on a fresh box; all kernel tests pass. Parity on the 400-record public-source DEV slice
+(the full DEV set stays on hermeslab), latency with tilde-eval (warm, best of 3, ms):
+
+| preset | 1k | 4k | 16k | 32k | 64k (1q) | slice accuracy | log loss | mean \|dp\| | peak VRAM |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Q8_0 | 26 | 84 | 408 | 939 | 2,372 | -0.27 pt | +0.0039 | .0066 | 14.0 GB |
+| Q4_KE | 25 | 82 | 411 | 941 | 2,371 | -0.07 pt | -0.0001 | .0148 | 10.7 GB |
+| I8CX | 18 | 52 | 267 | 654 | 1,781 | -0.07 pt | -0.0065 | .0100 | 14.5 GB |
+| I8CX+PV8 | 18 | 51 | 258 | 621 | 1,652 | +0.20 pt | -0.0106 | .0128 | 14.6 GB |
+| **I8CX+FAST (default)** | 18 | 50 | 246 | **575** | **1,473** | -0.07 pt | -0.0004 | .0099 | 14.5 GB |
+| NVFP4E (native W4A4) | 22 | 79 | 386 | 892 | 2,271 | **-0.74 pt** | **+0.0139** | .0227 | 10.7 GB |
+
+`tilde-server` with no flags (I8CX file): picks I8CX + fast attention; warm 32k 640 ms (1 question) / 623 ms (8),
+64k 1,521 ms, 1k 23 ms; peak GPU 14.1 GB. Long requests vs PyTorch (FAST): mean |dp| .0056 / .0101 at 32k (1 / 8
+questions), .0006 / .0204 at 64k. NVFP4E with Blackwell's native W4A4 is over the budget on this slice (log loss) and
+slower than I8CX: not recommended.
+
+The first run aborted at the 64k sweep: the Tilde graph was sized at `n_tokens * 40` nodes, a 50 GB host allocation for
+the scheduler at 64k that only worked where memory is overcommitted. Fixed (b89d5a191): `n_tokens + 16,384` (the graph
+has 12,383 nodes at 65,536 tokens).
 
 ## Open problems / what is left
 
@@ -167,7 +180,6 @@ credential on exit, and also runs the `tilde-server` default path (no flags) wit
   uses 64 of 84 SMs). Ideas, none started: V cast elision for FAST (~8 ms), attention with fewer registers for 3 blocks
   per SM, a persistent delta-net inter kernel, fusing the MoE gather into the grouped GEMM's A loads (CUTLASS
   gather), quantizing the KDA output in its gate kernel.
-- The 5090 run (native FP4 W4A4 for NVFP4E, sm_120 timings).
 - Metal and ROCm are untested (no hardware); Vulkan passes parity (older build).
 - `schedule/free_11` in the conformance set is missed by I8CX and Q8_0 (p 0.91, want false); not yet checked against
   PyTorch.
