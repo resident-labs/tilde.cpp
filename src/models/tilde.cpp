@@ -543,6 +543,20 @@ static ggml_tensor * tilde_residual_chunked(ggml_context * ctx, ggml_cgraph * gf
     return out;
 }
 
+// the head's products over all tokens (memory projection, cross-attention K and V) may run with F16 operands and F32
+// accumulation (CUDA tensor cores; the default F32 path is TF32 there, the same 10-bit mantissa). TILDE_HEAD_F16=0 off.
+static ggml_tensor * tilde_head_mm_f16(ggml_tensor * mm) {
+    static const bool on = [] {
+        const char * e = getenv("TILDE_HEAD_F16");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (on) {
+        ggml_prec_set_src(mm, GGML_PREC_F16, 0);
+        ggml_prec_set_src(mm, GGML_PREC_F16, 1);
+    }
+    return mm;
+}
+
 static bool tilde_residual_in_place() {
     static const bool v = [] {
         const char * e = getenv("TILDE_RESID_INPLACE");
@@ -839,8 +853,8 @@ ggml_tensor * llama_model_tilde::graph::build_head_attn(ggml_tensor * q, ggml_te
     const int64_t d_head   = n_embd_h / n_head_h;
 
     ggml_tensor * Qcur = ggml_add(ctx0, ggml_mul_mat(ctx0, a.wq, q),  a.bq);
-    ggml_tensor * Kcur = ggml_add(ctx0, ggml_mul_mat(ctx0, a.wk, kv), a.bk);
-    ggml_tensor * Vcur = ggml_add(ctx0, ggml_mul_mat(ctx0, a.wv, kv), a.bv);
+    ggml_tensor * Kcur = ggml_add(ctx0, tilde_head_mm_f16(ggml_mul_mat(ctx0, a.wk, kv)), a.bk);
+    ggml_tensor * Vcur = ggml_add(ctx0, tilde_head_mm_f16(ggml_mul_mat(ctx0, a.wv, kv)), a.bv);
 
     Qcur = ggml_reshape_3d(ctx0, Qcur, d_head, n_head_h, q->ne[1]);
     Kcur = ggml_reshape_3d(ctx0, Kcur, d_head, n_head_h, kv->ne[1]);
@@ -906,7 +920,7 @@ ggml_tensor * llama_model_tilde::graph::build_head(ggml_tensor * hidden, input_d
     hidden = build_head_norm(hidden, model.hidden_norm);
     cb(hidden, "decision_hidden", -1);
 
-    ggml_tensor * memory = ggml_mul_mat(ctx0, model.proj_memory, hidden); // [n_embd_h, n_tokens]
+    ggml_tensor * memory = tilde_head_mm_f16(ggml_mul_mat(ctx0, model.proj_memory, hidden)); // [n_embd_h, n_tokens]
     const int64_t n_embd_h = memory->ne[0];
 
     // hidden state of the last token

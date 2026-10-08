@@ -715,6 +715,22 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
             CUDA_CHECK(cudaFree(p));
         }
     }
+    if (i8_pre.q != nullptr || i8_pre.s != nullptr || !i8_pre.retired.empty()) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(i8_pre.q));
+        CUDA_CHECK(cudaFree(i8_pre.s));
+        for (void * p : i8_pre.retired) {
+            CUDA_CHECK(cudaFree(p));
+        }
+    }
+    if (i8_glu.q != nullptr || i8_glu.s != nullptr || !i8_glu.retired.empty()) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(i8_glu.q));
+        CUDA_CHECK(cudaFree(i8_glu.s));
+        for (void * p : i8_glu.retired) {
+            CUDA_CHECK(cudaFree(p));
+        }
+    }
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
@@ -1977,6 +1993,22 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    // F32 x F32 where both operands may be rounded to F16 (ggml_prec_set_src(dst, GGML_PREC_F16, 0 and 1)): tensor
+    // cores with F16 operands and F32 accumulation (cuBLAS converts on the fly)
+    if (src0->type == GGML_TYPE_F32 && ggml_get_op_params_i32(dst, 2) >= GGML_PREC_F16 &&
+            ggml_get_op_params_i32(dst, 3) >= GGML_PREC_F16 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA &&
+            ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 && nb00 == sizeof(float) && nb10 == sizeof(float) &&
+            ggml_is_contiguous(dst) && ne11 >= 256) {
+        const float alpha = 1.0f, beta = 0.0f;
+        cublasHandle_t h = ctx.cublas_handle();
+        CUBLAS_CHECK(cublasSetStream(h, ctx.stream()));
+        CUBLAS_CHECK(cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, (int) ne01, (int) ne11, (int) ne10,
+            &alpha, src0->data, CUDA_R_32F, (int) (nb01 / sizeof(float)),
+                    src1->data, CUDA_R_32F, (int) (nb11 / sizeof(float)),
+            &beta,  dst->data,  CUDA_R_32F, (int) ne0,
+            CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
         return;
     }
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
@@ -4391,7 +4423,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes &&
             ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, { i, i + 2 }) &&
             ggml_cuda_add_rms_norm_mul_fusable(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
-        ggml_cuda_op_add_rms_norm_mul_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        int8_t * q8 = nullptr;
+        float  * s8 = nullptr;
+        ggml_cuda_mmi8_pre_quant(*cuda_ctx, cgraph, i + 2, cgraph->nodes[i + 2], q8, s8);
+        ggml_cuda_op_add_rms_norm_mul_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], q8, s8);
         return 2;
     }
 
@@ -4411,6 +4446,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+        // with the int8 rows for the I8 products that read the result, when it has the shape for it
+        int8_t * q8 = nullptr;
+        float  * s8 = nullptr;
+        if (ggml_cuda_rms_norm_mul_q8_ok(node, cgraph->nodes[i + 1]) &&
+                ggml_cuda_mmi8_pre_quant(*cuda_ctx, cgraph, i + 1, cgraph->nodes[i + 1], q8, s8)) {
+            ggml_cuda_op_rms_norm_mul_q8(*cuda_ctx, node, cgraph->nodes[i + 1], q8, s8);
+            return 1;
+        }
         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
     }
@@ -4721,6 +4764,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     cuda_ctx->i8_act.data  = nullptr;
     cuda_ctx->i8_ids.graph = nullptr;
     cuda_ctx->i8_ids.ids   = nullptr;
+    cuda_ctx->i8_glu.graph = nullptr;
+    cuda_ctx->i8_glu.glu   = nullptr;
+    cuda_ctx->i8_pre.graph = nullptr;
+    cuda_ctx->i8_pre.data  = nullptr;
     cuda_ctx->fattn_i8_elided.clear();
 
     bool use_cuda_graph             = false;

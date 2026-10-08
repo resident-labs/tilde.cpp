@@ -31,15 +31,17 @@ static constexpr int GDN_NV         = 32;  // value columns per block of the seq
 static constexpr int GDN_SEG_CHUNKS = 128; // chunks per segment (4096 tokens)
 static constexpr int GDN_THREADS    = 256;
 
-// per (seq, head, chunk) in the temporary buffer, token-major ([BT][D] rows of 128 floats)
+// per (seq, head, chunk) in the temporary buffer, token-major ([BT][D] rows of 128 values). w, scale q e^G and
+// k e^(Gl - G) are only tensor-core operands (TF32: 10-bit mantissa), so they are stored as f16 (same mantissa, half
+// the traffic); u enters v' = u - w S in f32 and stays f32. Offsets in floats; the f16 blocks take BT*D/2 floats each.
 struct gdn_layout {
-    static constexpr int W      = 0;                          // w                 [BT][D]
-    static constexpr int QG     = W  + GDN_BT * GDN_D;        // scale q e^G       [BT][D]
-    static constexpr int KL     = QG + GDN_BT * GDN_D;        // k e^(Gl - G)      [BT][D]
-    static constexpr int U      = KL + GDN_BT * GDN_D;        // u                 [BT][D]
-    static constexpr int A      = U  + GDN_BT * GDN_D;        // A                 [BT][BT]
-    static constexpr int GL     = A  + GDN_BT * GDN_BT;       // exp(G_last)       [D]
-    static constexpr int stride = GL + GDN_D;
+    static constexpr int U      = 0;                          // u                 [BT][D]   f32
+    static constexpr int A      = U  + GDN_BT * GDN_D;        // A                 [BT][BT]  f32
+    static constexpr int GL     = A  + GDN_BT * GDN_BT;       // exp(G_last)       [D]       f32
+    static constexpr int W      = GL + GDN_D;                 // w                 [BT][D]   f16
+    static constexpr int QG     = W  + GDN_BT * GDN_D / 2;    // scale q e^G       [BT][D]   f16
+    static constexpr int KL     = QG + GDN_BT * GDN_D / 2;    // k e^(Gl - G)      [BT][D]   f16
+    static constexpr int stride = KL + GDN_BT * GDN_D / 2;
 };
 static_assert(gdn_layout::stride % 4 == 0, "16-byte aligned chunks");
 
@@ -224,8 +226,8 @@ __global__ void __launch_bounds__(GDN_THREADS, 2) gdn_chunk_intra(const gdn_src 
                 kl[i] = ke * expf(Gl - G);
                 gl[i] = expf(Gl);
             }
-            *(float2 *) (out + gdn_layout::QG + lt * D + d) = make_float2(qg[0], qg[1]);
-            *(float2 *) (out + gdn_layout::KL + lt * D + d) = make_float2(kl[0], kl[1]);
+            *(half2 *) ((half *) (out + gdn_layout::QG) + lt * D + d) = __floats2half2_rn(qg[0], qg[1]);
+            *(half2 *) ((half *) (out + gdn_layout::KL) + lt * D + d) = __floats2half2_rn(kl[0], kl[1]);
             if (lt == 0) {
                 *(float2 *) (out + gdn_layout::GL + d) = make_float2(gl[0], gl[1]);
             }
@@ -351,8 +353,8 @@ __global__ void __launch_bounds__(GDN_THREADS, 2) gdn_chunk_intra(const gdn_src 
 #pragma unroll
         for (int nt = 0; nt < 4; nt++) {
             const int n = nc0 + nt * 8 + 2 * tq;
-            *(float2 *) (out + gdn_layout::W + r0 * D + n)       = make_float2(accW[nt][0], accW[nt][1]);
-            *(float2 *) (out + gdn_layout::W + (r0 + 8) * D + n) = make_float2(accW[nt][2], accW[nt][3]);
+            *(half2 *) ((half *) (out + gdn_layout::W) + r0 * D + n)       = __floats2half2_rn(accW[nt][0], accW[nt][1]);
+            *(half2 *) ((half *) (out + gdn_layout::W) + (r0 + 8) * D + n) = __floats2half2_rn(accW[nt][2], accW[nt][3]);
             *(float2 *) (out + gdn_layout::U + r0 * D + n)       = make_float2(accU[nt][0], accU[nt][1]);
             *(float2 *) (out + gdn_layout::U + (r0 + 8) * D + n) = make_float2(accU[nt][2], accU[nt][3]);
         }
@@ -384,11 +386,11 @@ static __device__ __forceinline__ void gdn_commit() {
 #endif // CP_ASYNC_AVAILABLE
 }
 
-static constexpr int GDN_WS = GDN_D + 4;   // row stride of W, QG, KL ([BT][D]): conflict-free A fragments
+static constexpr int GDN_WS = GDN_D + 8;   // row stride (halves) of W, QG, KL ([BT][D] f16): conflict-free fragments
 static constexpr int GDN_VS = GDN_NV + 8;  // row stride of u, v', S ([.][NV]): conflict-free B fragments
 static constexpr int GDN_AS = GDN_BT + 4;  // row stride of A
 static constexpr size_t GDN_INTER_SMEM =
-    (3 * GDN_BT * GDN_WS       // W, QG, KL
+    (3 * GDN_BT * GDN_WS / 2   // W, QG, KL (f16)
      + GDN_BT * GDN_VS         // u (this block's columns)
      + GDN_BT * GDN_AS         // A
      + GDN_D                   // exp(G_last)
@@ -410,10 +412,10 @@ __global__ void __launch_bounds__(GDN_THREADS, 1) gdn_chunk_inter(
     static_assert(GDN_THREADS / WARP_SIZE == 8 && D == 128 && BT == 32 && NV == 32, "the warp mapping assumes these sizes");
 
     extern __shared__ __align__(16) float smem[];
-    float * sW  = smem;              // [BT][WS]
-    float * sQ  = sW + BT * WS;      // [BT][WS]
-    float * sK  = sQ + BT * WS;      // [BT][WS]
-    float * sU  = sK + BT * WS;      // [BT][VS]
+    half  * sW  = (half *) smem;     // [BT][WS] f16
+    half  * sQ  = sW + BT * WS;      // [BT][WS] f16
+    half  * sK  = sQ + BT * WS;      // [BT][WS] f16
+    float * sU  = (float *) (sK + BT * WS); // [BT][VS]
     float * sA  = sU + BT * VS;      // [BT][AS]
     float * sGL = sA + BT * AS;      // [D]
     float * sVN = sGL + D;           // [BT][VS]  v'
@@ -433,11 +435,12 @@ __global__ void __launch_bounds__(GDN_THREADS, 1) gdn_chunk_inter(
     auto chunk = [&](int c) { return head + (int64_t) c * gdn_layout::stride; };
 
     // operand groups, each committed as one cp.async group: 1 = (W, u), 2 = (QG, A), 3 = (KL, exp(G_last))
-    auto load_rows = [&](float * dstm, const float * srcm) {
-        for (int i = tid; i < BT * (D / 4); i += GDN_THREADS) {
-            const int t = i / (D / 4);
-            const int q = i % (D / 4);
-            gdn_copy16(dstm + t * WS + q * 4, srcm + t * D + q * 4);
+    auto load_rows = [&](half * dstm, const float * src_f) {
+        const half * srcm = (const half *) src_f;
+        for (int i = tid; i < BT * (D / 8); i += GDN_THREADS) {
+            const int t = i / (D / 8);
+            const int q = i % (D / 8);
+            cp_async_cg_16<0>(ggml_cuda_cvta_generic_to_shared(dstm + t * WS + q * 8), srcm + t * D + q * 8);
         }
     };
     auto load1 = [&](int c) {
@@ -497,8 +500,8 @@ __global__ void __launch_bounds__(GDN_THREADS, 1) gdn_chunk_inter(
             float acc[4] = {};
 #pragma unroll
             for (int k0 = 0; k0 < D; k0 += 8) {
-                gdn_mma(acc, sW[r0 * WS + k0 + tq], sW[(r0 + 8) * WS + k0 + tq],
-                             sW[r0 * WS + k0 + tq + 4], sW[(r0 + 8) * WS + k0 + tq + 4],
+                gdn_mma(acc, __half2float(sW[r0 * WS + k0 + tq]), __half2float(sW[(r0 + 8) * WS + k0 + tq]),
+                             __half2float(sW[r0 * WS + k0 + tq + 4]), __half2float(sW[(r0 + 8) * WS + k0 + tq + 4]),
                              sS[(k0 + tq) * VS + cb], sS[(k0 + tq + 4) * VS + cb]);
             }
             const float2 u0 = *(const float2 *) (sU + r0 * VS + cc);
@@ -519,8 +522,8 @@ __global__ void __launch_bounds__(GDN_THREADS, 1) gdn_chunk_inter(
             float acc[4] = {};
 #pragma unroll
             for (int k0 = 0; k0 < D; k0 += 8) {
-                gdn_mma(acc, sQ[r0 * WS + k0 + tq], sQ[(r0 + 8) * WS + k0 + tq],
-                             sQ[r0 * WS + k0 + tq + 4], sQ[(r0 + 8) * WS + k0 + tq + 4],
+                gdn_mma(acc, __half2float(sQ[r0 * WS + k0 + tq]), __half2float(sQ[(r0 + 8) * WS + k0 + tq]),
+                             __half2float(sQ[r0 * WS + k0 + tq + 4]), __half2float(sQ[(r0 + 8) * WS + k0 + tq + 4]),
                              sS[(k0 + tq) * VS + cb], sS[(k0 + tq + 4) * VS + cb]);
             }
             // A is lower triangular: rows 0..15 only need keys 0..15
@@ -566,10 +569,10 @@ __global__ void __launch_bounds__(GDN_THREADS, 1) gdn_chunk_inter(
 #pragma unroll
             for (int k0 = 0; k0 < BT; k0 += 8) {
                 // A fragment = KL^T: row d, column t  ->  KL[t][d]
-                const float a0 = sK[(k0 + tq) * WS + d0];
-                const float a1 = sK[(k0 + tq) * WS + d0 + 8];
-                const float a2 = sK[(k0 + tq + 4) * WS + d0];
-                const float a3 = sK[(k0 + tq + 4) * WS + d0 + 8];
+                const float a0 = __half2float(sK[(k0 + tq) * WS + d0]);
+                const float a1 = __half2float(sK[(k0 + tq) * WS + d0 + 8]);
+                const float a2 = __half2float(sK[(k0 + tq + 4) * WS + d0]);
+                const float a3 = __half2float(sK[(k0 + tq + 4) * WS + d0 + 8]);
 #pragma unroll
                 for (int j = 0; j < 4; j++) {
                     gdn_mma(acc[j], a0, a1, a2, a3, sVN[(k0 + tq) * VS + j * 8 + g], sVN[(k0 + tq + 4) * VS + j * 8 + g]);

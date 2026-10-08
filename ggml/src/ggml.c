@@ -3322,7 +3322,8 @@ bool ggml_prec_set_src(
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {
-                if (idx != 1) {
+                // src0 (op_params[2]) and src1 (op_params[3])
+                if (idx != 1 && (idx != 0 || a->op != GGML_OP_MUL_MAT)) {
                     return false;
                 }
 

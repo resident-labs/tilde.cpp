@@ -4934,6 +4934,72 @@ struct test_mul_mat_i8 : public test_case {
     }
 };
 
+// I8 products reading a fused RMS norm (or residual ADD + RMS norm) result and a range of its rows: CUDA writes the
+// int8 rows in the norm kernel (ggml_cuda_mmi8_pre_quant)
+struct test_norm_i8 : public test_case {
+    const int64_t k, n;
+    const bool add;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "NORM_I8";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(k, n, add);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_norm_i8(int64_t k = 256, int64_t n = 70, bool add = false) : k(k), n(n), add(add) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        if (add) {
+            ggml_tensor * r = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+            x = ggml_add(ctx, x, r);
+        }
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+        ggml_tensor * y = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, k, 64);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, k, 64);
+        ggml_tensor * sa = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
+        ggml_tensor * sb = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
+        ggml_set_name(sa, "s");
+        ggml_set_name(sb, "s");
+        ggml_tensor * o1 = ggml_mul(ctx, ggml_mul_mat(ctx, a, y), sa);
+        ggml_tensor * yv = ggml_view_2d(ctx, y, k, n / 2, y->nb[1], (n / 3) * y->nb[1]);
+        ggml_tensor * o2 = ggml_mul(ctx, ggml_mul_mat(ctx, b, yv), sb);
+        ggml_tensor * out = ggml_concat(ctx, o1, o2, 1);
+        if (add) {
+            out = ggml_add(ctx, out, ggml_sum(ctx, x)); // the ADD result is used too
+        }
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(4321);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I8) {
+                std::uniform_int_distribution<int> d(-127, 127);
+                std::vector<int8_t> v(ggml_nelements(t));
+                for (auto & x : v) {
+                    x = (int8_t) d(rng);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size());
+            } else if (strcmp(t->name, "s") == 0) {
+                init_tensor_uniform(t, 0.001f, 0.01f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // MUL_MAT_ID with I8 experts and per-row-per-expert scales (CUDA: grouped int8 GEMM)
 struct test_mul_mat_id_i8 : public test_case {
     const int64_t n_mats, n_used, m, n, k, ne11;
@@ -11994,6 +12060,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_i8());
     test_cases.emplace_back(new test_moe_i8(128, 8, 1536, 512, 300));
     test_cases.emplace_back(new test_moe_i8(16, 4, 256, 128, 70, true));
+    test_cases.emplace_back(new test_norm_i8(256, 70, false));
+    test_cases.emplace_back(new test_norm_i8(1536, 300, false));
+    test_cases.emplace_back(new test_norm_i8(1536, 300, true));
     test_cases.emplace_back(new test_moe_group_route(70, 8));
     test_cases.emplace_back(new test_moe_group_route(1000, 8));
     test_cases.emplace_back(new test_moe_group_route(33, 7));

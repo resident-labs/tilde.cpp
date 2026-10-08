@@ -1467,6 +1467,22 @@ struct ggml_backend_cuda_context {
         std::vector<void *> retired; // outgrown buffers, kept until the context is destroyed (captured CUDA graphs may use them)
     } i8_act;
 
+    // int8 GEMM: int8 rows written by the producer of an activation (a fused RMS norm) for the I8 products that read
+    // it or row ranges of it (token chunks), until a later node overwrites it
+    struct {
+        const ggml_cgraph * graph = nullptr;
+        const void *  data   = nullptr;
+        int64_t       K      = 0;
+        int64_t       n_rows = 0;
+        int64_t       nb1    = 0;
+        int     valid_until = -1;
+        int8_t * q      = nullptr;
+        float  * s      = nullptr;
+        size_t   q_size = 0;
+        size_t   s_size = 0;
+        std::vector<void *> retired;
+    } i8_pre;
+
     // f32 -> f16 copies skipped because only the int8 attention reads them (it reads their f32 source, fattn-i8.cu)
     std::unordered_set<const ggml_tensor *> fattn_i8_elided;
 
@@ -1480,6 +1496,17 @@ struct ggml_backend_cuda_context {
         size_t    size = 0, bounds_size = 0;
         std::vector<void *> retired;
     } i8_ids;
+
+    // int8 experts: the SwiGLU of gate_up written straight as the int8 rows (expert-sorted, with row scales) of the
+    // down projection that is its only reader; `glu` is the GLU node whose f32 output was skipped
+    struct {
+        const ggml_cgraph * graph = nullptr;
+        const ggml_tensor * glu = nullptr;
+        int8_t * q = nullptr;
+        float  * s = nullptr;
+        size_t   q_size = 0, s_size = 0;
+        std::vector<void *> retired;
+    } i8_glu;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};

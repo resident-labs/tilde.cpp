@@ -16,6 +16,11 @@ bool ggml_cuda_mul_mat_i8_scale_fusable(const ggml_tensor * mm, const ggml_tenso
 void ggml_cuda_mul_mat_i8(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
         const ggml_tensor * mm, const float * w_scale, ggml_tensor * out, const ggml_cgraph * cgraph, int node_idx);
 
+// the producer of `out` (node node_idx) can write its int8 rows (one scale per row) for the I8 products that read
+// it or ranges of its rows: returns the buffers (q [rows][K], s [rows]) when one of the next nodes does
+bool ggml_cuda_mmi8_pre_quant(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx,
+        const ggml_tensor * out, int8_t * & q, float * & s);
+
 // MUL_MAT_ID with I8 experts [K, N, E] and the per-row-per-expert scales [N, E] in src[3] (ggml_mul_mat_id_scaled):
 // tokens sorted by expert, per-token int8 activations, one CUTLASS grouped int8 GEMM for all experts, then the
 // scales and the scatter back to token order.
