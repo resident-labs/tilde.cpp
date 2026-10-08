@@ -2428,7 +2428,13 @@ void llama_context::output_reorder() {
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     uint32_t res;
-    if (model.arch == LLM_ARCH_KIMI_K3 || model.arch == LLM_ARCH_GLM5_NEXT) {
+    if (model.arch == LLM_ARCH_TILDE) {
+        // the Tilde graph grows with the MoE token chunks (~1,100 nodes per 8,192-token chunk; 12,383 nodes at 65,536
+        // tokens), not per token: n_tokens * 40 would size the scheduler's context for 2.6M nodes (a 50 GB host
+        // allocation at 64k), which fails where memory is not overcommitted. n_tokens + 16,384 covers chunks down to
+        // ~1,024 tokens.
+        res = std::max<uint32_t>(n_tokens + 16384u, 32u * model.n_tensors());
+    } else if (model.arch == LLM_ARCH_KIMI_K3 || model.arch == LLM_ARCH_GLM5_NEXT) {
         // the n_tokens*40 budget below is exhausted at ubatch 3840
         res = std::max<uint32_t>(n_tokens * 160, 64u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_HRM_TEXT) {
@@ -2440,7 +2446,6 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_QWEN35 ||
         model.arch == LLM_ARCH_QWEN35MOE ||
         model.arch == LLM_ARCH_CLEF ||
-        model.arch == LLM_ARCH_TILDE ||
         model.arch == LLM_ARCH_QWEN4EXP ||
         model.arch == LLM_ARCH_DEEPSEEK4 ||
         (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0) ||
