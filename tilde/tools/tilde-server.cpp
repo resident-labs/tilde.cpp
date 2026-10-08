@@ -151,31 +151,40 @@ int main(int argc, char ** argv) {
     if (!has_arg(args, {"-m", "--model", "-hf", "-hfr", "--hf-repo", "-mu", "--model-url"})) {
         args.insert(args.begin(), {"-hf", DEFAULT_REPO});
     }
-    std::string hf = arg_value(args, {"-hf", "-hfr", "--hf-repo"});
-    if (!hf.empty() && hf.find(':') == std::string::npos) {
+    const std::string m  = arg_value(args, {"-m", "--model"});
+    const std::string hf = arg_value(args, {"-hf", "-hfr", "--hf-repo"});
+    // on the CPU the whole file is in memory (the device figures leave the token embeddings out)
+    const double host_extra = dev.gpu ? 0.0 : HOST_ONLY_MIB;
+    std::error_code ec;
+    const auto m_size = m.empty() ? 0 : std::filesystem::file_size(m, ec);
+    if (!m.empty() && !ec) {
+        // a local file (wins over -hf when both are given)
+        weights_mib = m_size / (1024.0 * 1024.0) - (dev.gpu ? HOST_ONLY_MIB : 0.0);
+    } else if (!hf.empty() && hf.find(':') == std::string::npos) {
         const size_t n_presets = sizeof(PRESETS) / sizeof(PRESETS[0]);
         const preset * pick = &PRESETS[n_presets - 1];
         for (const auto & p : PRESETS) {
-            if (max_tokens(p.weights_mib) >= 65536) {
+            if (max_tokens(p.weights_mib + host_extra) >= 65536) {
                 pick = &p;
                 break;
             }
         }
         chosen = pick->tag;
-        weights_mib = pick->weights_mib;
+        weights_mib = pick->weights_mib + host_extra;
         for (size_t i = 0; i + 1 < args.size(); i++) {
             if (args[i] == "-hf" || args[i] == "-hfr" || args[i] == "--hf-repo") {
                 args[i + 1] = hf + ":" + chosen;
             }
         }
     } else {
-        const std::string m = arg_value(args, {"-m", "--model"});
-        std::error_code ec;
-        const auto size = m.empty() ? 0 : std::filesystem::file_size(m, ec);
-        if (!m.empty() && !ec) {
-            weights_mib = size / (1024.0 * 1024.0) - (dev.gpu ? HOST_ONLY_MIB : 0.0);
-        } else {
-            weights_mib = PRESETS[0].weights_mib; // a tagged -hf: assume the default preset
+        // a tagged -hf (repo:PRESET): the size of that preset, the default one for an unknown tag
+        const std::string tag = hf.find(':') != std::string::npos ? hf.substr(hf.find(':') + 1) : "";
+        weights_mib = PRESETS[0].weights_mib + host_extra;
+        for (const auto & p : PRESETS) {
+            if (tag == p.tag) {
+                weights_mib = p.weights_mib + host_extra;
+                chosen = p.tag;
+            }
         }
     }
 

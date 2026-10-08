@@ -4,7 +4,8 @@
 Starts the server command, waits until it answers, then for every body in --bodies (make_bench.py output) sends it
 once (cold: the first request of that shape) and --repeat more times (warm: the median). While each request runs it
 samples the GPU memory in use (nvidia-smi, whole device) and the server's resident memory (VmRSS of the process
-tree). Prints a markdown table and writes JSON lines.
+tree). peak_gpu_server_mib is the peak minus what was in use before the server started (a desktop, a VRAM ballast);
+without --cmd (a server that is already running) it only counts the growth during the requests. Prints a markdown table and writes JSON lines.
 
     python bench_server.py --cmd "tilde-server -m M.gguf --port 8091" --url http://127.0.0.1:8091 \\
         --bodies bench_bodies.jsonl --out results.jsonl [--repeat 3] [--label "Q8_0 3090 Ti"]
@@ -155,7 +156,7 @@ def main():
             out.write(json.dumps(row) + "\n")
             out.flush()
             print(f"  {row['id']}: {n} tokens, cold {row['cold_ms']} ms, warm {row['warm_ms']} ms, "
-                  f"{row['tokens_per_s']} tok/s, GPU {row['peak_gpu_server_mib']} MiB, RSS {row['peak_rss_mib']} MiB", flush=True)
+                  f"{row['tokens_per_s']} tok/s, GPU {row['peak_gpu_server_mib'] if row['peak_gpu_server_mib'] is not None else row['peak_gpu_mib']} MiB, RSS {row['peak_rss_mib']} MiB", flush=True)
     if proc is not None:
         os.killpg(proc.pid, signal.SIGTERM)
         try:
