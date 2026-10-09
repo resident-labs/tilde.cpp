@@ -6,9 +6,10 @@ After=network-online.target
 Type=simple
 WorkingDirectory=%h/tilde-omni
 # I8C + int8 attention on an Ampere+ CUTLASS build, else Q8_0; the mmproj from the same dir.
-# Sharing a 24 GB GPU with tilde-server (~12.9 GB): add "-c 20480" (see STATUS.md, "Tilde Omni", service)
-Environment=TILDE_MODELS=%h/tilde-omni/models
-ExecStart=%h/tilde-omni/tilde.cpp/build-cuda-p4/bin/tilde-server --tilde-family omni --host 127.0.0.1 --port 18797
+# -c 16384: fits beside tilde-server (~12.9 GB) on the 24 GB 3090 Ti (STATUS.md, "Tilde Omni", service)
+# current -> the served models dir; swap: ln -sfn NEWDIR ~/tilde-omni/current && systemctl --user restart tilde-omni-server
+Environment=TILDE_MODELS=%h/tilde-omni/current
+ExecStart=%h/tilde-omni/tilde.cpp/build-cuda-p4/bin/tilde-server --tilde-family omni --host 127.0.0.1 --port 18797 -c 16384
 ExecStartPost=/bin/bash -c "for i in $$(seq 1 180); do curl -sf -o /dev/null http://127.0.0.1:18797/health && exit 0; sleep 1; done; exit 1"
 TimeoutStartSec=240
 TimeoutStopSec=30
