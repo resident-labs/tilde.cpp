@@ -18,11 +18,16 @@ vision_token_ids) and 2 ids for the start / end markers of audio blocks (the ref
 with the audio module's markers). Their rows of the token table hold those marker embeddings; the row of point none in
 the output table is the point head's none_lexical vector, and the token-type table gets a 4th row (point fields).
 
-The temperature: --temperature is the total temperature to serve at. A folded checkpoint (report temperature_fold)
-already holds its own; the converter folds only the remaining factor.
+The temperature: --temperature is the total temperature to serve at. A folded checkpoint already holds part of it
+(final_folded on HF: 1.28 until it is re-uploaded; a re-folded copy: 1.40), and the converter folds only the
+remaining factor. The temperature already folded is measured, not read from the report (which a re-fold may leave
+stale): --unfolded-head names the joint head of the unfolded checkpoint (final/joint_head.safetensors), and the
+folded temperature is exp(joint_logit_scale(final) - joint_logit_scale(folded)), checked against the residual
+scorer's output weights (folded = final / T). --checkpoint-temperature states it instead (1.0: an unfolded
+checkpoint).
 
     python tilde/convert_tilde_omni_to_gguf.py --base TLive-Omni-4B/ --checkpoint final_folded/ --temperature 1.40 \\
-        --outtype bf16 --outfile tilde-4b-omni-BF16.gguf
+        --unfolded-head final/joint_head.safetensors --outtype bf16 --outfile tilde-4b-omni-BF16.gguf
 """
 from __future__ import annotations
 
@@ -385,12 +390,45 @@ def check_tokenizer(work: Path, start: int) -> dict:
             "pad_token_id": -1 if tok.pad_token_id is None else int(tok.pad_token_id)}
 
 
+def measure_folded_temperature(unfolded: Path, folded: Path) -> float:
+    """The temperature folded into a joint head: exp(joint_logit_scale(unfolded) - joint_logit_scale(folded)), with the
+    residual scorer's output layer as a check (tilda's fold divides it by T)."""
+    from safetensors import safe_open
+    with safe_open(str(unfolded), "pt") as a, safe_open(str(folded), "pt") as b:
+        if set(a.keys()) != set(b.keys()):
+            raise SystemExit(f"{unfolded} and {folded} are not the same head")
+        T = math.exp(float(a.get_tensor("joint_logit_scale")) - float(b.get_tensor("joint_logit_scale")))
+        T_prior = math.exp(float(a.get_tensor("prior_logit_scale")) - float(b.get_tensor("prior_logit_scale")))
+        if abs(T_prior / T - 1) > 1e-4:
+            raise SystemExit(f"inconsistent fold: joint_logit_scale says T={T:.6f}, prior_logit_scale says {T_prior:.6f}")
+        changed = []
+        for name in sorted(a.keys()):
+            x, y = a.get_tensor(name).double(), b.get_tensor(name).double()
+            if x.shape != y.shape:
+                raise SystemExit(f"{name}: shapes differ between the unfolded and folded heads")
+            if not torch.equal(x, y):
+                changed.append(name)
+        w = "residual_scorer.3.weight"
+        if abs(T - 1) > 1e-6:
+            x, y = a.get_tensor(w).double(), b.get_tensor(w).double()
+            ratio = float((x * y).sum() / (y * y).sum())
+            if abs(ratio / T - 1) > 1e-3:
+                raise SystemExit(f"inconsistent fold: joint_logit_scale says T={T:.6f}, {w} says {ratio:.6f}")
+    logger.info(f"folded temperature measured from the heads: {T:.6f} (tensors changed by the fold: {changed})")
+    return T
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base", type=Path, required=True, help="TLive-Omni-4B directory (HF layout)")
     ap.add_argument("--checkpoint", type=Path, required=True, help="Tilde Omni checkpoint directory (final_folded)")
     ap.add_argument("--temperature", type=float, required=True,
                     help="total temperature to serve at (1.40: the full-DEV fit of omni_full_tlive4b_20261007)")
+    fold = ap.add_mutually_exclusive_group(required=True)
+    fold.add_argument("--unfolded-head", type=Path,
+                      help="joint_head.safetensors of the unfolded checkpoint (final/): measures the folded temperature")
+    fold.add_argument("--checkpoint-temperature", type=float,
+                      help="the temperature already folded into --checkpoint (1.0: not folded)")
     ap.add_argument("--outfile", type=Path, required=True)
     ap.add_argument("--outtype", choices=("bf16", "f16", "f32", "q8_0"), default="bf16")
     ap.add_argument("--head-type", choices=("f32", "f16"), default="f32", help="type of the joint head tensors")
@@ -426,8 +464,19 @@ def main() -> None:
     audio_spec = report.get("audio_spec") or {}
     if not audio_spec.get("native") or audio_spec.get("acif") or audio_spec.get("l12"):
         raise SystemExit(f"unsupported audio spec {audio_spec}")
-    folded = float((report.get("temperature_fold") or {}).get("temperature") or 1.0)
+    reported = float((report.get("temperature_fold") or {}).get("temperature") or 1.0)
+    if args.unfolded_head is not None:
+        folded = measure_folded_temperature(args.unfolded_head, args.checkpoint / "joint_head.safetensors")
+    else:
+        folded = args.checkpoint_temperature
+        if not (math.isfinite(folded) and folded > 0):
+            raise SystemExit("checkpoint temperature must be finite and positive")
+    if abs(folded / reported - 1) > 1e-3:
+        logger.warning(f"report.json says temperature {reported} is folded, the head holds {folded:.6f}: using the head")
     extra = args.temperature / folded
+    if extra < 1 - 1e-6:
+        logger.warning(f"the checkpoint holds temperature {folded:.6f} > --temperature {args.temperature}: "
+                       f"folding {extra:.6f} < 1 (sharpening)")
     logger.info(f"checkpoint temperature {folded}, serving temperature {args.temperature}: folding {extra:.6f}")
 
     verified = {}
@@ -464,6 +513,7 @@ def main() -> None:
             "checkpoint_report_sha256": sha256_file(args.checkpoint / "report.json"),
             "checkpoint_head_sha256": verified.get("joint_head.safetensors", ""),
             "checkpoint_temperature": folded,
+            "checkpoint_temperature_source": "measured" if args.unfolded_head is not None else "stated",
         }
         ftype = {"f32": gguf.LlamaFileType.ALL_F32, "f16": gguf.LlamaFileType.MOSTLY_F16,
                  "bf16": gguf.LlamaFileType.MOSTLY_BF16, "q8_0": gguf.LlamaFileType.MOSTLY_Q8_0}[args.outtype]

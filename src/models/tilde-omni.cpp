@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <string>
 
 // Tilde Omni: TLive-Omni-4B's Qwen3.5 text decoder (3 Gated DeltaNet layers : 1 gated full-attention layer) trained
 // with the Tilde joint decision head. The whole request is one ubatch and no memory module is used: the Gated
@@ -540,6 +541,20 @@ public:
 
 // Tokens per chunk of the FFN: the whole request is one ubatch (the full-attention layers attend over all of it), so
 // without chunking the 9216-wide FFN intermediates of a 64k request take several GB. TILDE_CHUNK_TOKENS overrides it.
+// full-attention kernel (TILDE_OMNI_FA): 0 / unset = f16 flash attention; int8 = int8 Q*K^T with f32 P*V
+// accumulation; fast = int8 Q*K^T with f16 P*V accumulation (SageAttention2-style, overflow rerun)
+static int tilde_omni_fa_mode() {
+    static const int v = [] {
+        const char * env = std::getenv("TILDE_OMNI_FA");
+        if (env == nullptr) {
+            return 0;
+        }
+        const std::string e = env;
+        return e == "fast" ? 2 : e == "int8" ? 1 : 0;
+    }();
+    return v;
+}
+
 static int64_t tilde_omni_chunk_tokens() {
     static const int64_t value = [] {
         const char * env = std::getenv("TILDE_CHUNK_TOKENS");
@@ -728,7 +743,23 @@ ggml_tensor * llama_model_tilde_omni::graph::build_layer_attn(ggml_tensor * cur,
     if (!cparams.flash_attn && n_tokens > 4096) {
         throw std::runtime_error("tilde_omni: requests over 4096 tokens need flash attention (-fa on)");
     }
-    cur = build_attn_mha(Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, nullptr, n_tokens, kq_scale, il);
+    const int fa_mode = tilde_omni_fa_mode();
+    if (cparams.flash_attn && fa_mode != 0) {
+        ggml_tensor * fq = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
+        ggml_tensor * fk = ggml_cast(ctx0, ggml_permute(ctx0, Kcur, 0, 2, 1, 3), GGML_TYPE_F16);
+        ggml_tensor * fv = ggml_cast(ctx0, ggml_permute(ctx0, Vcur, 0, 2, 1, 3), GGML_TYPE_F16);
+        cur = ggml_flash_attn_ext(ctx0, fq, fk, fv, nullptr, kq_scale, 0.0f, 0.0f);
+        ggml_prec_set_acc(cur, GGML_PREC_F32);
+        // int8 Q*K^T, SageAttention-style (CUDA, Ampere and newer: fattn-sage256.cu; other backends ignore the hint)
+        ggml_prec_set_src(cur, GGML_PREC_Q8, 0);
+        ggml_prec_set_src(cur, GGML_PREC_Q8, 1);
+        if (fa_mode == 2) {
+            ggml_prec_set_src(cur, GGML_PREC_F16, 2); // f16 P*V accumulated in f16
+        }
+        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0] * cur->ne[1], cur->ne[2] * cur->ne[3]);
+    } else {
+        cur = build_attn_mha(Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, nullptr, n_tokens, kq_scale, il);
+    }
     cb(cur, "attn_pregate", il);
 
     cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));

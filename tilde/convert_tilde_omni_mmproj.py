@@ -132,6 +132,17 @@ def main() -> None:
         raise SystemExit(f"unsupported vision spec {spec}")
     if not audio_spec.get("native") or audio_spec.get("acif") or audio_spec.get("l12"):
         raise SystemExit(f"unsupported audio spec {audio_spec}")
+    # the graph feeds the merger output to the bridge as is: no projector norm (tilda.vision.model.Bridge:
+    # projector_l2norm / --vision-projector-norm mean keep a projected_scale buffer)
+    from safetensors import safe_open
+    with safe_open(str(args.checkpoint / "vision.safetensors"), framework="pt") as st:
+        vision_keys = set(st.keys())
+    if meta.get("projector_l2norm") or any(k.endswith("projected_scale") for k in vision_keys):
+        raise SystemExit("checkpoints with a normalized projector output (projector_l2norm / projected_scale) are not supported")
+    # the ViT position-embedding interpolation of the graph is bilinear with align_corners (transformers' Qwen3.5 ViT)
+    vcfg = json.loads((args.base / "config.json").read_text()).get("vision_config") or {}
+    if vcfg.get("interpolation_mode", "bilinear") != "bilinear" or not vcfg.get("interpolation_align_corners", True):
+        raise SystemExit("the ViT position embeddings must interpolate bilinearly with align_corners")
 
     with tempfile.TemporaryDirectory(prefix="tilde-omni-mmproj-") as tmp:
         work = Path(tmp)

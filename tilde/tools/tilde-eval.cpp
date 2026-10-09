@@ -289,9 +289,16 @@ int main(int argc, char ** argv) {
                     const int rows = m.at("rows").get<int>(), cols = m.at("cols").get<int>();
                     std::vector<int32_t> toc;
                     if (bitmaps.size() == 1) {
+                        const int nx = (int) mtmd_bitmap_get_nx(bitmaps[0].ptr.get()), ny = (int) mtmd_bitmap_get_ny(bitmaps[0].ptr.get());
+                        if (nx != cols * 32 || ny != rows * 32) {
+                            fprintf(stderr, "%s: image %dx%d is not the record's %dx%d cells\n", r.id.c_str(), nx, ny, cols, rows);
+                            return 1;
+                        }
                         toc.resize((size_t) rows * cols);
-                        mtmd_tilde_merge_cells(mtmd_bitmap_get_data(bitmaps[0].ptr.get()), mtmd_bitmap_get_nx(bitmaps[0].ptr.get()),
-                                mtmd_bitmap_get_ny(bitmaps[0].ptr.get()), toc.data());
+                        if (mtmd_tilde_merge_cells(mtmd_bitmap_get_data(bitmaps[0].ptr.get()), nx, ny, toc.data()) < 0) {
+                            fprintf(stderr, "%s: blank merging failed\n", r.id.c_str());
+                            return 1;
+                        }
                     }
                     const int k = m.at("image").get<int>();
                     if ((int) layouts.size() <= k) layouts.resize(k + 1);
@@ -394,6 +401,10 @@ int main(int argc, char ** argv) {
                 if (q.type == 3) {
                     n_read += 1 + layouts.at(q.image).n_tokens() + tilde_omni::POINT_EXTRA;
                 }
+            }
+            if (out_embd == nullptr || n_read > 4 * r.ids.size()) {
+                fprintf(stderr, "%s: %zu outputs do not fit the batch's %zu\n", r.id.c_str(), n_read, 4 * r.ids.size());
+                return 1;
             }
             scores.assign(out_embd, out_embd + n_read);
             const auto t1 = std::chrono::steady_clock::now();

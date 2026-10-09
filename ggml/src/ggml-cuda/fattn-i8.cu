@@ -1,5 +1,6 @@
 #include "fattn-i8.cuh"
 #include "fattn-sage.cuh"
+#include "fattn-sage256.cuh"
 #include "convert.cuh"
 #include "cp-async.cuh"
 
@@ -52,6 +53,17 @@ bool ggml_cuda_flash_attn_ext_i8_applies(int device, const ggml_tensor * dst) {
     const int32_t prec_q = ggml_get_op_params_i32(dst, 5);
     const int32_t prec_k = ggml_get_op_params_i32(dst, 6);
     const int cc = ggml_cuda_info().devices[device].cc;
+    if (Q->ne[0] == 256) {
+        // 256-dim heads, grouped K/V heads (fattn-sage256.cu)
+        return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_AMPERE && cc >= GGML_CUDA_CC_AMPERE &&
+            prec_q >= GGML_PREC_Q8 && prec_k >= GGML_PREC_Q8 && ggml_get_op_params_i32(dst, 7) < GGML_PREC_Q8 &&
+            max_bias == 0.0f && softcap == 0.0f &&
+            Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
+            K->ne[0] == 256 && V->ne[0] == 256 && K->ne[2] == V->ne[2] && K->ne[2] > 0 && Q->ne[2] % K->ne[2] == 0 &&
+            Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1 && K->ne[1] == V->ne[1] && K->ne[1] >= 64 &&
+            Q->nb[0] == sizeof(float) && K->nb[0] == 2 && V->nb[0] == 2 && V->nb[1] % 16 == 0 && V->nb[2] % 16 == 0 &&
+            ggml_cuda_info().devices[device].smpbo >= ggml_sage256_smem();
+    }
     return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_AMPERE && cc >= GGML_CUDA_CC_AMPERE &&
         prec_q >= GGML_PREC_Q8 && prec_k >= GGML_PREC_Q8 && max_bias == 0.0f && softcap == 0.0f &&
         Q->type == GGML_TYPE_F32 && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
@@ -736,6 +748,28 @@ void ggml_cuda_flash_attn_ext_i8(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     float scale = 1.0f;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+
+    if (Q->ne[0] == 256) {
+        // f16 P*V accumulated in f16 over the whole row (GGML_PREC_F16 on src 2, with an overflow rerun) or in f32
+        const int64_t H_kv = K->ne[2];
+        const bool k_f32 = ctx.fattn_i8_elided.count(K) != 0;
+        const ggml_tensor * Ks = k_f32 ? K->src[0] : K;
+        GGML_ASSERT(ctx.fattn_i8_elided.count(V) == 0);
+        const int64_t n_part = (n_kv + ggml_sage256_kpart_rows() - 1) / ggml_sage256_kpart_rows();
+        ggml_cuda_pool_alloc<int8_t> q8(ctx.pool(), H * n_q * 256);
+        ggml_cuda_pool_alloc<int8_t> k8(ctx.pool(), H_kv * n_kv * 256);
+        ggml_cuda_pool_alloc<float>  qs(ctx.pool(), H * ggml_sage256_q_scales(n_q));
+        ggml_cuda_pool_alloc<float>  ks(ctx.pool(), H_kv * ggml_sage256_k_scales(n_kv));
+        ggml_cuda_pool_alloc<float>  ksum(ctx.pool(), H_kv * 256);
+        ggml_cuda_pool_alloc<float>  kpart(ctx.pool(), n_part * H_kv * 256);
+        ggml_cuda_pool_alloc<int>    flag(ctx.pool(), 1);
+        ggml_sage256_attn(Q->data, Q->nb[1], Q->nb[2], Ks->data, k_f32, Ks->nb[1], Ks->nb[2], V->data, V->nb[1], V->nb[2],
+            (float *) dst->data, dst->nb[2] / sizeof(float), dst->nb[1] / sizeof(float), n_q, n_kv, H, H_kv, scale,
+            ggml_get_op_params_i32(dst, 7) != GGML_PREC_F16, q8.get(), k8.get(), qs.get(), ks.get(), ksum.get(),
+            kpart.get(), flag.get(), stream);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
 
     const int n_part = (int) ((n_kv + I8_KSUM_ROWS - 1) / I8_KSUM_ROWS);
     ggml_cuda_pool_alloc<float>  kpart(ctx.pool(), (int64_t) n_part * H * I8_DQK);

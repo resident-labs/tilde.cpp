@@ -369,6 +369,11 @@ static mtmd_bitmap * decode_webp_with_ffmpeg(const mtmd_context * mctx, const un
 static void mtmd_helper_video_set_id(mtmd_helper_video * vctx, const std::string & id);
 #endif
 
+bool mtmd_helper_image_size(const unsigned char * buf, size_t len, int * nx, int * ny) {
+    int comp = 0;
+    return len <= (size_t) INT32_MAX && stbi_info_from_memory(buf, (int) len, nx, ny, &comp) == 1;
+}
+
 mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_buf(const mtmd_context * ctx, const unsigned char * buf, size_t len, bool placeholder,
                                                             mtmd_helper_init_opt opt) {
     // calculate the hash if needed

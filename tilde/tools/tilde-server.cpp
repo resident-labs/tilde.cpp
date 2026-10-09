@@ -33,6 +33,24 @@ int llama_server(int argc, char ** argv);
 static const char * DEFAULT_REPO = "resident-labs/tilde-8b-a1b-GGUF";
 static const double GiB = 1024.0 * 1024.0 * 1024.0;
 
+// Tilde Omni (tilde-4b-omni): --tilde-family omni / TILDE_FAMILY=omni, or a -m file / --tilde-models dir of
+// tilde-4b-omni-<PRESET>.gguf. Presets: I8C (int8 GEMMs, Ampere+ with CUTLASS), Q8_0; the media encoders come from
+// mmproj-tilde-4b-omni-F16.gguf in the models dir (unless --mmproj is given). Device memory measured on the 3090 Ti
+// (STATUS.md, "Tilde Omni").
+struct omni_preset {
+    const char * tag;
+    double       weights_mib; // LM weights on the device (token table on the host) + the mmproj
+    bool         int8;
+};
+static const omni_preset OMNI_PRESETS[] = {
+    { "I8C",  7700.0, true  },
+    { "Q8_0", 7900.0, false },
+};
+// device memory beyond the weights for a request limit of n tokens (MiB), measured on the 3090 Ti
+static double omni_runtime_mib(int64_t n_tokens) {
+    return 900.0 + 0.10 * (double) n_tokens;
+}
+
 // device memory of the presets' weights (MiB, measured on CUDA: the token embeddings stay in host memory)
 struct preset {
     const char * tag;

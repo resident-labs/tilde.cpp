@@ -4571,6 +4571,7 @@ static void clip_tilde_omni_set_inputs(const clip_image_f32 & img, int patch_siz
     GGML_ASSERT((int) token_of_cell.size() == n_cells);
     int n_tokens = 0;
     for (int32_t t : token_of_cell) {
+        GGML_ASSERT(t >= 0 && t < n_cells);
         n_tokens = std::max(n_tokens, t + 1);
     }
     std::vector<std::vector<int>> members(n_tokens);

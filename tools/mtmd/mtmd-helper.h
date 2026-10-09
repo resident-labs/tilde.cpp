@@ -80,6 +80,10 @@ MTMD_API struct mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_buf(
                     bool placeholder,
                     struct mtmd_helper_init_opt opt);
 
+// the size of an image in a buffer from its header, without decoding it (stb_image formats); false if stb_image does
+// not recognize the buffer
+MTMD_API bool mtmd_helper_image_size(const unsigned char * buf, size_t len, int * nx, int * ny);
+
 // helper to count the total number of tokens from a list of chunks, useful to keep track of KV cache
 MTMD_API size_t mtmd_helper_get_n_tokens(const mtmd_input_chunks * chunks);
 

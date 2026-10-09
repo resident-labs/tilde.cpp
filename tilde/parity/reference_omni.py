@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -53,9 +54,20 @@ def cmd_textview(args) -> None:
     print(json.dumps({"text_view": str(dst), "files": sorted(report["files"])}))
 
 
-def checkpoint_temperature(checkpoint: Path) -> float:
+def checkpoint_temperature(checkpoint: Path, unfolded_head: Path | None = None) -> float:
+    """The temperature folded into the checkpoint's joint head: measured against the unfolded head when given
+    (exp(joint_logit_scale(final) - joint_logit_scale(folded)), as the converter), else report.json's."""
     report = json.loads((checkpoint / "report.json").read_text())
-    return float((report.get("temperature_fold") or {}).get("temperature") or 1.0)
+    reported = float((report.get("temperature_fold") or {}).get("temperature") or 1.0)
+    if unfolded_head is None:
+        print(json.dumps({"checkpoint_temperature": reported, "source": "report.json (not measured)"}),
+              file=sys.stderr, flush=True)
+        return reported
+    from safetensors import safe_open
+    with safe_open(str(unfolded_head), "pt") as a, safe_open(str(checkpoint / "joint_head.safetensors"), "pt") as b:
+        T = math.exp(float(a.get_tensor("joint_logit_scale")) - float(b.get_tensor("joint_logit_scale")))
+    print(json.dumps({"checkpoint_temperature": T, "source": "measured", "report": reported}), file=sys.stderr, flush=True)
+    return T
 
 
 def cmd_encode(args) -> None:
@@ -109,7 +121,7 @@ def cmd_run(args) -> None:
         serve_profile=args.serve_profile)
     model.eval()
     pad = tokenizer.pad_token_id or 0
-    extra = args.temperature / checkpoint_temperature(args.checkpoint)
+    extra = args.temperature / checkpoint_temperature(args.checkpoint, args.unfolded_head)
     print(json.dumps({"attention_mode": getattr(model, "attention_mode", None), "extra_temperature": extra}),
           file=sys.stderr)
     records = read_records(args.records, args.limit)
@@ -161,6 +173,8 @@ def main() -> None:
     p.add_argument("--base", type=Path, required=True)
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--temperature", type=float, required=True, help="total serving temperature (as the GGUF)")
+    p.add_argument("--unfolded-head", type=Path,
+                   help="joint_head.safetensors of the unfolded checkpoint: measure the folded temperature (as the converter)")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--limit", type=int)
     p.add_argument("--max-tokens", type=int, help="only records up to this many tokens")

@@ -103,7 +103,7 @@ def cmd_run(args) -> None:
                                   *train_argv(report, args.base.resolve(), enc / "vision", enc / "audio",
                                               args.media_root.resolve())])
     tokenizer, marker_start = run_tokenizer(targs)
-    extra = args.temperature / checkpoint_temperature(args.checkpoint)
+    extra = args.temperature / checkpoint_temperature(args.checkpoint, args.unfolded_head)
     if args.records_only:  # the records alone (CPU): stores without a model
         from types import SimpleNamespace
         from tilda.qwen35.model.online import open_audio_store, open_vision_store
@@ -293,6 +293,7 @@ def main() -> None:
     p.add_argument("--base", type=Path, required=True)
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--temperature", type=float, required=True)
+    p.add_argument("--unfolded-head", type=Path, help="joint_head.safetensors of the unfolded checkpoint (see reference_omni)")
     p.add_argument("--subsets", type=Path, required=True)
     p.add_argument("--set", required=True)
     p.add_argument("--enc", type=Path, required=True)

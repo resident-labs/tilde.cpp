@@ -186,7 +186,7 @@ has 12,383 nodes at 65,536 tokens).
 
 # Tilde Omni (tilde-4b-omni)
 
-Last updated 2026-10-08 21:35 CDT. Model: TLive-Omni-4B (TaoLiveAIGC/TLive-Omni-4B @ cfbac342, Qwen3.5-4B text decoder
+Last updated 2026-10-08 22:30 CDT. Model: TLive-Omni-4B (TaoLiveAIGC/TLive-Omni-4B @ cfbac342, Qwen3.5-4B text decoder
 + Qwen3.5 ViT + AuT audio tower) trained from base with the Tilde joint head and the unified point head
 (`omni_full_tlive4b_20261007/final_folded`). Measured on hermeslab (RTX 3090 Ti, i7-12700K) unless marked.
 
@@ -195,18 +195,24 @@ Last updated 2026-10-08 21:35 CDT. Model: TLive-Omni-4B (TaoLiveAIGC/TLive-Omni-
 1. Text path: **done** (arch `tilde_omni`, converter, CPU + CUDA parity, request-encoder parity; independent review
    clean after 10 findings fixed: lexical-table and none-vector checks in the converter, a compact media input path
    instead of 3072-wide inputs for every token, output-capacity rejection, smaller no-FA limit, gguf-py names).
-2. Vision + pointing: code written (mmproj converter, `tilde_omni_v` clip graph, point head in the LM graph,
-   `/v1/systemone` images + `point` questions, tilde-eval `--mmproj`); parity not run yet.
-3. Audio: code written (`tilde_omni_a`: AuT + native bridge, Whisper-exact frames, valid-token windows); parity not run.
-4. Speed: not started.
+2. Vision + pointing: **parity done** (mmproj converter, `tilde_omni_v` clip graph, point head in the LM graph,
+   `/v1/systemone` images + `point` questions, tilde-eval `--mmproj`); every subset within the gates (below).
+   Independent review: 9 findings (no parity defect; converter guards against projector norms and other ViT
+   interpolation, request media limits checked from the image header before decoding, tilde-eval size checks,
+   layout range checks, Python-exact rounding of point diagnostics), fixed; re-review clean.
+3. Audio: **parity done** (`tilde_omni_a`: AuT + native bridge, Whisper-exact frames, valid-token windows).
+4. Speed: in progress (int8 Q*K^T attention for 256-dim GQA heads, `fattn-sage256.cu`, written, not yet measured).
 5. Service: not started.
 
 ## Temperature
 
-The HF `final_folded` holds the quick-fit T = 1.28 (its report's `temperature_fold`; checked against `final`'s head:
-the logit scales differ by exactly log 1.28). The full-DEV fit is T = 1.40 (FINAL_EVALS.json). The GGUF serves at
-T = 1.40: the converter folds the remaining factor 1.40 / 1.28 = 1.09375 into the head (`tilde.temperature_folded`
-1.40, `tilde.checkpoint_temperature` 1.28). The point head is not temperature-scaled (as trained).
+The HF `final_folded` of 2026-10-07 holds the quick-fit T = 1.28 (measured: `final`'s and `final_folded`'s
+joint_logit_scale differ by exactly log 1.28; the fold also changed prior_logit_scale and residual_scorer.3). The
+full-DEV fit is T = 1.40 (FINAL_EVALS.json), and the omni box's local `final_folded` was re-folded at 1.40 (to be
+re-uploaded). The GGUF serves at T = 1.40: the converter measures the folded temperature from the heads
+(`--unfolded-head final/joint_head.safetensors`; report.json is not trusted, a re-fold may leave it stale) and folds
+only the rest, 1.40 / 1.28 = 1.09375 here (`tilde.temperature_folded` 1.40, `tilde.checkpoint_temperature` 1.28), so a
+re-fetched 1.40 checkpoint is not folded twice. The point head is not temperature-scaled (as trained).
 
 ## Files
 
@@ -227,7 +233,7 @@ ids of `tilde_parity_20261008/gpu_sub.jsonl` (all 5,235 found, same field order)
 | CUDA Q8_0 | 7,365 | 0.8831 -> 0.8823 | -0.08 | +0.0001 | 0.0022 | 0.026 | 0.147 | 99.73% | pass |
 
 CPU (i7-12700K, 8 threads, 214 records <= 2,048 tokens / 277 fields): Q8_0 0.8700 -> 0.8628 (2 fields flip), mean
-|dp| 0.0021, argmax 99.28%. CPU BF16: running.
+|dp| 0.0021, argmax 99.28%; BF16 0.8700 -> 0.8664 (1 field flips), mean |dp| 0.0011, argmax 99.64%.
 
 Request encoder (`tilde/parity/encoder_parity.py` with the omni GGUF and tokenizer, 3,033 bodies from the DEV states +
 edge cases): 3,016 / 3,016 accepted bodies token- and order-exact against `tilda.joint_serving.encode_request`, 17 both
@@ -238,6 +244,28 @@ CUDA BF16 481.1 s, CUDA Q8_0 371.3 s (not yet optimized; long requests are slowe
 5.6 s BF16 vs 4.0 s PyTorch; Phase 4).
 
 GPU window for these runs: tilde-server down 20:50:01-21:12:53 CDT (1,372 s).
+
+## Parity: vision, pointing, ScreenSpot-v2, audio (the checkpoint-eval subsets of OMNI_FULL_RUN.md)
+
+Subsets rebuilt exactly as the run's `EVAL_SUBSETS` (vision 1,248 rows, pointing DEV 722 rows, ScreenSpot-v2 600,
+audio 849). Reference: `tilde/parity/reference_omni_media.py run` (tilda.qwen35 `build_t4` with the online
+TLive encoders, serve profile ampere24_bf16, Clef logits / 1.09375); the same records through
+`tilde-eval --mmproj` (CUDA, BF16 LM + F16 mmproj, flash attention). Point fields: hit = click inside the target box,
+or `none` when the target is off screen (same rule both sides), same click = identical token and sub-cell location.
+
+| subset | records | fields | accuracy (ref -> GGUF) | delta (pt) | log loss delta | mean abs dp | p99 abs dp | argmax agreement |
+|---|---:|---:|---|---:|---:|---:|---:|---:|
+| vision | 781 | 1,248 | 0.8397 -> 0.8397 | 0.00 | +0.0005 | 0.0046 | 0.044 | 99.20% |
+| pointing DEV (choice fields) | 267 | 396 | 0.9141 -> 0.9192 | +0.51 | -0.0030 | 0.0035 | 0.047 | 99.49% |
+| audio | 351 | 849 | 0.7644 -> 0.7609 | -0.35 | +0.0003 | 0.0034 | 0.036 | 99.41% |
+
+| point subset | point fields | hit (ref -> GGUF) | delta (pt) | same click | mean abs dp(none) | mean max abs dp(token) |
+|---|---:|---|---:|---:|---:|---:|
+| pointing DEV | 326 (272 on screen) | 0.8558 -> 0.8589 | +0.31 | 96.3% | 0.0022 | 0.016 |
+| ScreenSpot-v2 | 600 | 0.8717 -> 0.8717 | 0.00 | 96.0% | 0.0023 | 0.019 |
+
+Wall time per subset including model load (PyTorch / tilde-eval BF16): vision 187 / 132 s, pointing 113 / 81 s,
+ScreenSpot 167 / 140 s, audio 170 / 51 s. GPU window: tilde-server down 21:55:02-22:12:42 CDT (1,060 s).
 
 ## Open problems
 

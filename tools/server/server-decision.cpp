@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <regex>
 #include <stdexcept>
 
@@ -1596,6 +1598,11 @@ json server_decision_context::format_answer_tilde(const server_decision_question
 
 // "images": [image, ...], each a data URL / base64 string or {"data": ..., "label": "screenshot", "time": t,
 // "max_cells": n}; "budget_cells": cells for the whole request (default 2400; tilda.vision.budget.allocate)
+// limits on request media (decoded before any token count is known)
+static constexpr size_t TILDE_MEDIA_MAX_CHARS     = 48u << 20;  // base64 characters per image / audio clip
+static constexpr size_t TILDE_IMAGE_MAX_PIXELS    = 40000000;   // per image
+static constexpr size_t TILDE_REQUEST_MAX_PIXELS  = 120000000;  // per request
+
 server_decision_media server_decision_context::parse_media_tilde(const json & body, mtmd_context * mctx) const {
     server_decision_media media;
     // "audio": [clip, ...], each a data URL / base64 string or {"data": ..., "label": "audio"}
@@ -1616,6 +1623,9 @@ server_decision_media server_decision_context::parse_media_tilde(const json & bo
             const std::string url = data.get<std::string>();
             if (string_starts_with(url, "http") || string_starts_with(url, "file:")) {
                 throw std::invalid_argument(string_format("audio[%zu]: only inline (base64) audio is accepted", i));
+            }
+            if (url.size() > TILDE_MEDIA_MAX_CHARS) {
+                throw std::invalid_argument(string_format("audio[%zu]: over %zu MB of base64", i, TILDE_MEDIA_MAX_CHARS >> 20));
             }
             std::vector<raw_buffer> files;
             handle_media(files, url, "");
@@ -1657,6 +1667,7 @@ server_decision_media server_decision_context::parse_media_tilde(const json & bo
     std::vector<double> times;
     std::vector<int> caps;
     size_t n_timed = 0;
+    size_t total_px = 0;
     for (size_t i = 0; i < images.size(); i++) {
         const json & item = images.at(i);
         const json data = item.is_object() ? (item.contains("data") ? item.at("data") : json()) : item;
@@ -1668,10 +1679,30 @@ server_decision_media server_decision_context::parse_media_tilde(const json & bo
         if (string_starts_with(url, "http") || string_starts_with(url, "file:")) {
             throw std::invalid_argument(string_format("images[%zu]: only inline (base64) images are accepted", i));
         }
+        if (url.size() > TILDE_MEDIA_MAX_CHARS) {
+            throw std::invalid_argument(string_format("images[%zu]: over %zu MB of base64", i, TILDE_MEDIA_MAX_CHARS >> 20));
+        }
         handle_media(files, url, "");
+        // the size from the header first: a small, flat PNG can decode to gigabytes
+        int hx = 0, hy = 0;
+        if (!mtmd_helper_image_size(files[0].data(), files[0].size(), &hx, &hy) || hx < 1 || hy < 1) {
+            throw std::invalid_argument(string_format("images[%zu]: not a readable image (jpg, png, bmp, gif)", i));
+        }
+        if ((size_t) hx * hy > TILDE_IMAGE_MAX_PIXELS || total_px + (size_t) hx * hy > TILDE_REQUEST_MAX_PIXELS) {
+            throw std::invalid_argument(string_format("images[%zu]: over %zu Mpx per image or %zu Mpx per request",
+                i, TILDE_IMAGE_MAX_PIXELS / 1000000, TILDE_REQUEST_MAX_PIXELS / 1000000));
+        }
         mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf(mctx, files[0].data(), files[0].size(), false, mtmd_helper_init_opt_default()).bitmap);
         if (!bmp.ptr || mtmd_bitmap_is_audio(bmp.ptr.get())) {
             throw std::invalid_argument(string_format("images[%zu]: not a readable image", i));
+        }
+        files.clear();
+        files.shrink_to_fit();
+        const size_t px = (size_t) bmp.nx() * bmp.ny();
+        total_px += px;
+        if (px > TILDE_IMAGE_MAX_PIXELS || total_px > TILDE_REQUEST_MAX_PIXELS) {
+            throw std::invalid_argument(string_format("images[%zu]: over %zu Mpx per image or %zu Mpx per request",
+                i, TILDE_IMAGE_MAX_PIXELS / 1000000, TILDE_REQUEST_MAX_PIXELS / 1000000));
         }
         server_decision_media::image img;
         img.width  = (int) bmp.nx();
@@ -1716,15 +1747,22 @@ server_decision_media server_decision_context::parse_media_tilde(const json & bo
         img.rgb.clear();
         img.rgb.shrink_to_fit();
         std::vector<int32_t> toc((size_t) (img.plan.width / 32) * (img.plan.height / 32));
-        mtmd_tilde_merge_cells(img.stored.data(), img.plan.width, img.plan.height, toc.data());
+        if (mtmd_tilde_merge_cells(img.stored.data(), img.plan.width, img.plan.height, toc.data()) < 0) {
+            throw std::runtime_error("blank merging failed");
+        }
         img.layout = tilde_omni::layout::make(img.plan.height / 32, img.plan.width / 32, std::move(toc));
     }
     return media;
 }
 
+// Python's round(v, digits): the exact binary value rounded half-even to the decimal digits (printf does that)
 static double tilde_round(double v, int digits) {
-    const double f = std::pow(10.0, digits);
-    return std::nearbyint(v * f) / f;
+    if (!std::isfinite(v)) {
+        return v;
+    }
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.*f", digits, v);
+    return strtod(buf, nullptr);
 }
 
 json server_decision_context::format_answers_tilde(

@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <set>
+#include <stdexcept>
 #include <vector>
 
 namespace tilde_omni {
@@ -45,8 +46,14 @@ struct layout {
         for (int32_t t : l.token_of_cell) {
             n_tok = std::max(n_tok, t + 1);
         }
+        if ((int) l.token_of_cell.size() != n) {
+            throw std::invalid_argument("token_of_cell does not cover the cells");
+        }
         std::vector<std::vector<int>> members(n_tok);
         for (int c = 0; c < n; c++) {
+            if (l.token_of_cell[c] < 0) {
+                throw std::invalid_argument("negative token in token_of_cell");
+            }
             members[l.token_of_cell[c]].push_back(c);
         }
         l.token_cell.resize(n_tok);
