@@ -3,7 +3,7 @@
 // P*V on f16 tensor cores. Adapted from SageAttention's sm80 kernel (vendor/sageattn, Apache-2.0) the same way as
 // fattn-sage.cu (192/128 MLA heads): 4 warps of 16 query rows per block, the whole 256-dim Q fragment of a warp in
 // registers (staged once through the V buffer), K (64 x 256 int8) and V (64 x 256 f16) tiles in shared memory, 48 KB
-// per block (two blocks per SM on sm_86), the output written as f32 straight from the registers.
+// per block (two blocks per SM on sm_86 in the f16-accumulation mode), the output written as f32 straight from the registers.
 //
 // Accumulation of P*V: f16 over the whole row (mode 0, the fast one; every output is checked and a flag is raised on
 // any non-finite value, and the same kernel with f32 accumulation then reruns the layer: it exits at once otherwise),
@@ -206,7 +206,19 @@ __global__ void __launch_bounds__(num_warps * WARP_SIZE) sage_attn_256(
             }
         }
         if (last) {
-            apply_out_of_bound_mask<num_tiles_q, num_tiles_k>(k_idx, RS_f32, kv_len);
+            // -inf, not the vendor's -5e6 in raw int-score units (which the scale could shrink to a finite logit)
+#pragma unroll
+            for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+#pragma unroll
+                for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
+#pragma unroll
+                    for (uint32_t k = 0; k < 8; k++) {
+                        if (k_idx + fk * 16 + 8 * (k / 4) + k % 2 >= kv_len) {
+                            RS_f32[fq][fk][k] = -INFINITY;
+                        }
+                    }
+                }
+            }
         }
         k_idx += CTA_K;
 

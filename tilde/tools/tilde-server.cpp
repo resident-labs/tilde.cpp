@@ -33,22 +33,32 @@ int llama_server(int argc, char ** argv);
 static const char * DEFAULT_REPO = "resident-labs/tilde-8b-a1b-GGUF";
 static const double GiB = 1024.0 * 1024.0 * 1024.0;
 
-// Tilde Omni (tilde-4b-omni): --tilde-family omni / TILDE_FAMILY=omni, or a -m file / --tilde-models dir of
-// tilde-4b-omni-<PRESET>.gguf. Presets: I8C (int8 GEMMs, Ampere+ with CUTLASS), Q8_0; the media encoders come from
-// mmproj-tilde-4b-omni-F16.gguf in the models dir (unless --mmproj is given). Device memory measured on the 3090 Ti
-// (STATUS.md, "Tilde Omni").
+// Tilde Omni (tilde-4b-omni): --tilde-family omni (or TILDE_FAMILY=omni), or a -m file / a --tilde-models dir of
+// tilde-4b-omni-<PRESET>.gguf files. Presets: I8C (int8 GEMMs; Ampere or newer with CUTLASS) with the int8 attention
+// (TILDE_OMNI_FA=fast), else Q8_0. The media encoders are mmproj-tilde-4b-omni-F16.gguf next to the model (unless
+// --mmproj is given). There is no public GGUF repo: the files are local.
+// device memory, measured on the 3090 Ti with llama-server + the F16 mmproj (STATUS.md, "Tilde Omni", service): peak
+// 11,751 MiB at a 32,768-token limit and 14,759 MiB at 65,536 (0.0918 MiB per token; 8,743 MiB at 0 tokens, of which
+// the mmproj file is ~2,050). Q8_0's weights are I8C's + 200 MiB (file sizes; not measured on the device).
+static constexpr double OMNI_I8C_MIB               = 5900.0;
+static constexpr double OMNI_Q8_0_MIB              = 6100.0;
+static constexpr double OMNI_HOST_ONLY_MIB         = 1215.0; // the bf16 token table (248,358 x 2,560), host memory
+static constexpr double OMNI_RUNTIME_BASE_MIB      = 900.0;
+static constexpr double OMNI_RUNTIME_PER_TOKEN_MIB = 0.095;
+static constexpr const char * OMNI_I8C_FA          = "fast";
 struct omni_preset {
     const char * tag;
-    double       weights_mib; // LM weights on the device (token table on the host) + the mmproj
+    double       weights_mib; // device memory of the LM weights (token table on the host), measured on the 3090 Ti
     bool         int8;
 };
 static const omni_preset OMNI_PRESETS[] = {
-    { "I8C",  7700.0, true  },
-    { "Q8_0", 7900.0, false },
+    { "I8C",  OMNI_I8C_MIB,  true  },
+    { "Q8_0", OMNI_Q8_0_MIB, false },
 };
-// device memory beyond the weights for a request limit of n tokens (MiB), measured on the 3090 Ti
+// device memory beyond the weights and the mmproj for a request limit of n tokens (MiB), measured on the 3090 Ti
+// (STATUS.md, "Tilde Omni", service): the compute buffer reserved at startup and the CUDA context
 static double omni_runtime_mib(int64_t n_tokens) {
-    return 900.0 + 0.10 * (double) n_tokens;
+    return OMNI_RUNTIME_BASE_MIB + OMNI_RUNTIME_PER_TOKEN_MIB * (double) n_tokens;
 }
 
 // device memory of the presets' weights (MiB, measured on CUDA: the token embeddings stay in host memory)
@@ -174,6 +184,86 @@ static device_info best_device(bool cpu_only) {
     return best;
 }
 
+// Tilde Omni: the preset (I8C where the int8 GEMMs run, else Q8_0; local files only), the mmproj next to it, the
+// attention. Rewrites args (-m, --mmproj); false on a fatal error (printed).
+template <typename MaxTokens>
+static bool omni_select(std::vector<std::string> & args, const std::string & models_dir, const device_info & dev,
+        MaxTokens && max_tokens, double & weights_mib, std::string & chosen, std::string & reason, std::string & attention) {
+    std::string m = arg_value(args, {"-m", "--model"});
+    if (has_arg(args, {"-hf", "-hfr", "--hf-repo", "-mu", "--model-url"})) {
+        fprintf(stderr, "tilde-server: tilde-4b-omni has no public GGUF repo: give -m FILE or --tilde-models DIR\n");
+        return false;
+    }
+    std::string dir = models_dir;
+    char buf[512];
+    if (m.empty()) {
+        if (dir.empty()) {
+            fprintf(stderr, "tilde-server: tilde-4b-omni: give -m tilde-4b-omni-<PRESET>.gguf or --tilde-models DIR\n");
+            return false;
+        }
+        auto file = [&](const char * tag) { return dir + "/tilde-4b-omni-" + tag + ".gguf"; };
+        const omni_preset * pick = dev.int8_gemm ? &OMNI_PRESETS[0] : &OMNI_PRESETS[1];
+        if (dev.int8_gemm) {
+            snprintf(buf, sizeof(buf), "%s device runs the int8 GEMMs (Ampere or newer, CUTLASS build): I8C", dev.backend.c_str());
+        } else {
+            snprintf(buf, sizeof(buf), "%s %s: Q8_0", dev.backend.c_str(), !dev.gpu ? "(no GPU)" :
+                     "does not run the I8C int8 GEMMs (needs NVIDIA Ampere or newer and a CUTLASS build)");
+        }
+        reason = buf;
+        if (!std::filesystem::exists(file(pick->tag))) {
+            const omni_preset * other = pick == &OMNI_PRESETS[0] ? &OMNI_PRESETS[1] : &OMNI_PRESETS[0];
+            if (!std::filesystem::exists(file(other->tag)) || (other->int8 && !dev.int8_gemm)) {
+                fprintf(stderr, "tilde-server: no usable tilde-4b-omni-{I8C,Q8_0}.gguf in %s\n", dir.c_str());
+                return false;
+            }
+            reason += std::string("; ") + pick->tag + " is not in " + dir + ", using " + other->tag;
+            pick = other;
+        }
+        m = file(pick->tag);
+        args.insert(args.begin(), {"-m", m});
+        chosen = pick->tag;
+        weights_mib = pick->weights_mib;
+    } else {
+        reason = "given with -m";
+        const std::string fname = std::filesystem::path(m).filename().string();
+        chosen = fname.find("I8C") != std::string::npos ? "I8C" : fname.find("Q8_0") != std::string::npos ? "Q8_0" : "";
+        std::error_code ec;
+        const auto size = std::filesystem::file_size(m, ec);
+        weights_mib = chosen.empty() ? (ec ? 0.0 : size / (1024.0 * 1024.0)) :
+                      chosen == "I8C" ? OMNI_PRESETS[0].weights_mib : OMNI_PRESETS[1].weights_mib;
+        dir = std::filesystem::path(m).parent_path().string();
+        if (dir.empty()) {
+            dir = ".";
+        }
+    }
+    if (!dev.gpu) {
+        weights_mib += OMNI_HOST_ONLY_MIB; // the token table too
+    }
+    // the media encoders
+    if (!has_arg(args, {"--mmproj", "-mm"})) {
+        const std::string mm = dir + "/mmproj-tilde-4b-omni-F16.gguf";
+        if (std::filesystem::exists(mm)) {
+            args.insert(args.end(), {"--mmproj", mm});
+        } else {
+            fprintf(stderr, "tilde-server: warning: no %s: text only (images and audio are refused)\n", mm.c_str());
+        }
+    }
+    const std::string mm = arg_value(args, {"--mmproj", "-mm"});
+    std::error_code ec;
+    const auto mm_size = mm.empty() ? 0 : std::filesystem::file_size(mm, ec);
+    weights_mib += ec ? 0.0 : mm_size / (1024.0 * 1024.0);
+    // int8 attention with the int8 GEMMs (parity-gated with I8C; TILDE_OMNI_FA overrides)
+    if (chosen == "I8C" && dev.int8_gemm) {
+        setenv("TILDE_OMNI_FA", OMNI_I8C_FA, /*overwrite =*/ 0);
+    }
+    const std::string fa = getenv("TILDE_OMNI_FA") ? getenv("TILDE_OMNI_FA") : "";
+    attention = !dev.gpu || fa.empty() || fa == "0" ? "default (f16 flash attention)" :
+                fa == "fast" ? "fast (int8 Q*K^T, f16 P*V accumulated in f16)" :
+                fa == "int8" ? "int8 Q*K^T, f16 P*V accumulated in f32" : "default (f16 flash attention)";
+    (void) max_tokens;
+    return true;
+}
+
 int main(int argc, char ** argv) {
     std::vector<std::string> args(argv + 1, argv + argc);
     const bool dry_run = has_arg(args, {"--tilde-plan"});
@@ -192,6 +282,38 @@ int main(int argc, char ** argv) {
     if (models_dir.empty() && getenv("TILDE_MODELS") != nullptr) {
         models_dir = getenv("TILDE_MODELS");
     }
+    // the model family: --tilde-family omni|8b (or TILDE_FAMILY); otherwise omni when -m names a tilde-4b-omni file or
+    // the models dir holds tilde-4b-omni presets and no tilde-8b-a1b ones
+    std::string family = getenv("TILDE_FAMILY") ? getenv("TILDE_FAMILY") : "";
+    for (size_t i = 0; i < args.size(); i++) {
+        if (args[i] == "--tilde-family" && i + 1 < args.size()) {
+            family = args[i + 1];
+            args.erase(args.begin() + i, args.begin() + i + 2);
+            break;
+        }
+    }
+    if (family.empty()) {
+        const std::string m0 = std::filesystem::path(arg_value(args, {"-m", "--model"})).filename().string();
+        auto any_file = [&](const char * prefix) {
+            std::error_code ec0;
+            if (models_dir.empty() || !std::filesystem::is_directory(models_dir, ec0)) {
+                return false;
+            }
+            for (const auto & e : std::filesystem::directory_iterator(models_dir, ec0)) {
+                if (e.path().filename().string().rfind(prefix, 0) == 0) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        family = m0.find("tilde-4b-omni") != std::string::npos ||
+                 (m0.empty() && any_file("tilde-4b-omni-") && !any_file("tilde-8b-a1b-")) ? "omni" : "8b";
+    }
+    if (family != "omni" && family != "8b") {
+        fprintf(stderr, "tilde-server: unknown --tilde-family %s (omni or 8b)\n", family.c_str());
+        return 1;
+    }
+    const bool omni = family == "omni";
 
     // -ngl 0 or --device none: the model runs on the CPU, so plan with host memory
     const std::string ngl_arg = arg_value(args, {"-ngl", "--gpu-layers", "--n-gpu-layers"});
@@ -202,9 +324,10 @@ int main(int argc, char ** argv) {
     // keep room for fragmentation (and, on the CPU, for the rest of the system)
     const double margin_mib = dev.gpu ? 256.0 : 2048.0;
     const double budget_mib = std::max(0.0, dev.free_gib * 1024.0 - margin_mib);
+    auto runtime = [&](int64_t n) { return omni ? omni_runtime_mib(n) : runtime_mib(n); };
     auto max_tokens = [&](double weights_mib) -> int64_t {
-        const double left = budget_mib - weights_mib - runtime_mib(0);
-        const int64_t n = left > 0 ? (int64_t) (left / (runtime_mib(1) - runtime_mib(0))) : 0;
+        const double left = budget_mib - weights_mib - runtime(0);
+        const int64_t n = left > 0 ? (int64_t) (left / (runtime(1) - runtime(0))) : 0;
         return std::min<int64_t>(65536, n / 1024 * 1024);
     };
 
@@ -213,7 +336,13 @@ int main(int argc, char ** argv) {
     double weights_mib = 0.0;
     std::string chosen;
     std::string reason;
+    std::string attention = "default (int8 Q*K^T where supported)";
     char buf[512];
+    if (omni) {
+        if (!omni_select(args, models_dir, dev, max_tokens, weights_mib, chosen, reason, attention)) {
+            return 1;
+        }
+    } else {
     if (!has_arg(args, {"-m", "--model", "-hf", "-hfr", "--hf-repo", "-mu", "--model-url"})) {
         args.insert(args.begin(), {"-hf", DEFAULT_REPO});
     }
@@ -299,7 +428,6 @@ int main(int argc, char ** argv) {
 
     // I8CX runs the SageAttention2-style attention unless TILDE_FA_FAST is set (TILDE_FA_FAST=0 keeps the int8 Q*K^T
     // with f16 P*V)
-    std::string attention = "default (int8 Q*K^T where supported)";
     if (chosen == "I8CX" && dev.int8_gemm) {
         setenv("TILDE_FA_FAST", "1", /*overwrite =*/ 0);
     }
@@ -312,6 +440,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "tilde-server: warning: I8CX needs NVIDIA Ampere or newer and a CUDA build with CUTLASS; %s cannot "
                 "run its int8 GEMMs\n", dev.name.c_str());
     }
+    } // 8b
 
     int64_t n_tokens = max_tokens(weights_mib);
     if (n_tokens < 1024) {
@@ -338,7 +467,7 @@ int main(int argc, char ** argv) {
     // runs on the CPU) instead of turning it off for every layer as "auto" would
     if (!has_arg(args, {"-fa", "--flash-attn"}))    args.insert(args.end(), {"-fa", "on"});
     if (!has_arg(args, {"-ngl", "--gpu-layers", "--n-gpu-layers"})) args.insert(args.end(), {"-ngl", "999"});
-    if (!has_arg(args, {"-a", "--alias"}))          args.insert(args.end(), {"--alias", "tilde-8b-a1b"});
+    if (!has_arg(args, {"-a", "--alias"}))          args.insert(args.end(), {"--alias", omni ? "tilde-4b-omni" : "tilde-8b-a1b"});
     if (n_tokens < 65536) {
         // the server rejects requests above the ubatch (never truncates them)
         fprintf(stderr, "tilde-server: requests are limited to %lld tokens (%.1f GiB free on %s, or a smaller -c/-b/-ub)\n",

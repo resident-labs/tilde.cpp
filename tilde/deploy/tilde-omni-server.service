@@ -1,0 +1,20 @@
+[Unit]
+Description=Tilde Omni decision server (tilde.cpp tilde-server, tilde-4b-omni, /v1/systemone on 127.0.0.1:18797)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/tilde-omni
+# I8C + int8 attention on an Ampere+ CUTLASS build, else Q8_0; the mmproj from the same dir.
+# Sharing a 24 GB GPU with tilde-server (~12.9 GB): add "-c 20480" (see STATUS.md, "Tilde Omni", service)
+Environment=TILDE_MODELS=%h/tilde-omni/models
+ExecStart=%h/tilde-omni/tilde.cpp/build-cuda-p4/bin/tilde-server --tilde-family omni --host 127.0.0.1 --port 18797
+ExecStartPost=/bin/bash -c "for i in $$(seq 1 180); do curl -sf -o /dev/null http://127.0.0.1:18797/health && exit 0; sleep 1; done; exit 1"
+TimeoutStartSec=240
+TimeoutStopSec=30
+KillSignal=SIGINT
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

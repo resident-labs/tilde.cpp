@@ -186,7 +186,7 @@ has 12,383 nodes at 65,536 tokens).
 
 # Tilde Omni (tilde-4b-omni)
 
-Last updated 2026-10-08 22:30 CDT. Model: TLive-Omni-4B (TaoLiveAIGC/TLive-Omni-4B @ cfbac342, Qwen3.5-4B text decoder
+Last updated 2026-10-08 23:59 CDT. Model: TLive-Omni-4B (TaoLiveAIGC/TLive-Omni-4B @ cfbac342, Qwen3.5-4B text decoder
 + Qwen3.5 ViT + AuT audio tower) trained from base with the Tilde joint head and the unified point head
 (`omni_full_tlive4b_20261007/final_folded`). Measured on hermeslab (RTX 3090 Ti, i7-12700K) unless marked.
 
@@ -201,8 +201,11 @@ Last updated 2026-10-08 22:30 CDT. Model: TLive-Omni-4B (TaoLiveAIGC/TLive-Omni-
    interpolation, request media limits checked from the image header before decoding, tilde-eval size checks,
    layout range checks, Python-exact rounding of point diagnostics), fixed; re-review clean.
 3. Audio: **parity done** (`tilde_omni_a`: AuT + native bridge, Whisper-exact frames, valid-token windows).
-4. Speed: in progress (int8 Q*K^T attention for 256-dim GQA heads, `fattn-sage256.cu`, written, not yet measured).
-5. Service: not started.
+4. Speed: **done for this round**: int8 attention for the 256-dim GQA heads (`fattn-sage256.cu`, `TILDE_OMNI_FA=fast`)
+   + the I8C int8 GEMMs; 32k text 6.95 s (BF16) -> 3.03 s (I8C+fast), every parity gate passed (below).
+5. Service: tilde-server picks the omni family (I8C + fast attention, mmproj beside it, alias tilde-4b-omni), memory
+   constants measured; unit file `tilde/deploy/tilde-omni-server.service` (port 18797) written, **not installed**:
+   it does not fit beside tilde-server at a 65,536-token limit (options below).
 
 ## Temperature
 
@@ -267,6 +270,38 @@ or `none` when the target is off screen (same rule both sides), same click = ide
 Wall time per subset including model load (PyTorch / tilde-eval BF16): vision 187 / 132 s, pointing 113 / 81 s,
 ScreenSpot 167 / 140 s, audio 170 / 51 s. GPU window: tilde-server down 21:55:02-22:12:42 CDT (1,060 s).
 
+## Speed (phase 4; 3090 Ti, tilde-server stopped, tilde-eval batch 1, last of 3 repeats, ms)
+
+| preset | 1k | 4k | 16k | 32k |
+|---|---:|---:|---:|---:|
+| BF16 | 147 | 576 | 2,777 | 6,952 |
+| Q8_0 | 105 | 435 | 2,286 | 5,998 |
+| Q8_0 + fast attention | 107 | 402 | 1,767 | 4,093 |
+| I8C | 75 | 320 | 1,809 | 5,025 |
+| I8C + int8 attention (f32 P*V accumulation) | 73 | 288 | 1,353 | 3,243 |
+| I8C + fast attention (f16 accumulation) | 73 | 283 | 1,283 | 3,025 |
+
+PyTorch reference for comparison (earlier, not this window): 32k ~2.8 s bf16 eager; ~1.3 s at 18.7k with the int8
+stack. Text parity (5,235 records / 7,365 fields vs the PyTorch reference): I8C +0.03 pt / +0.0008 log loss (mean |dp|
+0.0108); I8C+fast 0.00 pt / +0.0014 (0.0107); Q8_0+fast -0.08 pt / +0.0001 (0.0024: the attention adds little, the
+I8C GEMMs most of the difference). Media, I8C+fast vs reference: vision -0.64 pt / +0.0039, pointing DEV choice +1.26 pt,
+pointing hit +0.92 pt (same click 91.4%), ScreenSpot hit -0.50 pt (same click 90.5%), audio +0.35 pt / +0.0017. All
+within the gates (<= 1.0 pt loss, <= +0.01 log loss).
+
+HTTP (llama-server, I8C+fast, warm median): 1.1k tokens 92 ms, 3.8k 276 ms, 16.5k 1,341 ms; image (1 screenshot, point +
+noul, 385 tokens) 117 ms (cold 190); audio clip + choice (187 tokens) 45 ms.
+
+GPU window 3: tilde-server down 23:26:32-23:51:10 CDT (1,478 s) (an earlier attempt at 22:35 aborted after 13 s). Review (sonnet): clean after 2 fixes (padded keys masked to -inf, not a raw-unit -5e6; tilde-server matches family/preset on the file name); the mask fix only touches requests whose length is not a multiple of 64 and was not re-measured on the GPU.
+
+## Service (phase 5)
+
+Device memory (llama-server I8C + F16 mmproj, peak during requests): 11,751 MiB at a 32,768-token limit, 14,759 MiB at
+65,536. tilde-server (8b) uses 12,850 MiB of the 24,114. Both at once: 12,850 + 14,759 > 24 GB, so no at 65,536.
+Options (not decided): (a) omni with `-c 20480` (about 10.6 GB, estimate from the measured slope) beside tilde-server;
+(b) swap: one server at a time; (c) a smaller tilde-server limit; (d) a second GPU.
+
 ## Open problems
 
-- Speed on long requests (Phase 4): the full-attention layers (head_dim 256, GQA 4) and the delta net.
+- Media order: images then audio; time-ordered interleaving to add after phase 5 and measure on omni_av2_both.
+- webp is refused (decode it or answer 415).
+
