@@ -8,7 +8,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <regex>
+#include <string_view>
+#include <cstring>
 #include <stdexcept>
+
+// limits on request media (decoded before any token count is known)
+static constexpr size_t TILDE_MEDIA_MAX_CHARS     = 48u << 20;  // base64 characters per image / audio clip
+static constexpr size_t TILDE_IMAGE_MAX_PIXELS    = 40000000;   // per image
+static constexpr size_t TILDE_REQUEST_MAX_PIXELS  = 120000000;  // per request
+static constexpr size_t TILDE_MAX_AUDIO           = 256;        // audio items (clips or slices) per request
+static constexpr double TILDE_MAX_AUDIO_MEL_SECONDS = 3600.0;   // decoded seconds x slices per request
 
 static const char * decision_question_type_name(server_decision_question_type type) {
     switch (type) {
@@ -1375,64 +1384,105 @@ void server_decision_context::fill_task_tilde(
     marker(1);
     const std::string state_text = tilde_literal(state);
     raw(state_text);
-    for (size_t k = 0; k < media.images.size(); k++) {
-        const auto & img = media.images[k];
+    // the media blocks in their order (tilda.clef_joint._image_blocks): "Image k: <label>" / "Audio k: <label>" header
+    // lines (none with media_layout "stream"), images numbered among images, clips among clips
+    auto count_media = [](const mtmd::input_chunks_ptr & chunks) {
+        size_t n = 0;
+        for (size_t c = 0; c < mtmd_input_chunks_size(chunks.get()); c++) {
+            const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks.get(), c);
+            if (mtmd_input_chunk_get_type(chunk) != MTMD_INPUT_CHUNK_TYPE_TEXT) {
+                n += mtmd_input_chunk_get_n_tokens(chunk);
+            }
+        }
+        return n;
+    };
+    std::map<const raw_buffer *, std::vector<float>> decoded; // audio file -> PCM (16 kHz)
+    double mel_seconds = 0.0;
+    for (size_t s_i = 0; s_i < media.sequence.size(); s_i++) {
+        const auto [is_audio, k] = media.sequence[s_i];
         if (mctx == nullptr) {
             throw std::invalid_argument("this server has no media encoder (start it with --mmproj)");
         }
-        raw(std::string(!state_text.empty() || k > 0 ? "\n\n" : "") + "Image " + std::to_string(k + 1) + ": " + img.label + "\n");
-        media_id(0);
-        mtmd::bitmap bmp(img.plan.width, img.plan.height, img.stored.data());
-        mtmd_bitmap_set_tilde_scale(bmp.ptr.get(), (float) img.plan.scale);
-        mtmd::input_chunks_ptr chunks(mtmd_input_chunks_init());
-        const std::string m = get_media_marker();
-        mtmd_input_text text = { m.c_str(), m.size(), false, false };
-        const mtmd_bitmap * bptr = bmp.ptr.get();
-        if (mtmd_tokenize(mctx, chunks.get(), &text, &bptr, 1) != 0) {
-            throw std::runtime_error("failed to tokenize an image");
-        }
-        size_t n_media = 0;
-        for (size_t c = 0; c < mtmd_input_chunks_size(chunks.get()); c++) {
-            const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks.get(), c);
-            if (mtmd_input_chunk_get_type(chunk) != MTMD_INPUT_CHUNK_TYPE_TEXT) {
-                n_media += mtmd_input_chunk_get_n_tokens(chunk);
+        const std::string sep = !state_text.empty() || s_i > 0 ? "\n\n" : "";
+        if (!is_audio) {
+            const auto & img = media.images[k];
+            if (!media.stream) {
+                raw(sep + "Image " + std::to_string(k + 1) + ": " + img.label + "\n");
             }
-        }
-        if ((int) n_media != img.layout.n_tokens()) {
-            throw std::runtime_error("image token count differs from its layout");
-        }
-        media_at.emplace_back(tokens.size(), std::move(chunks));
-        tokens.insert(tokens.end(), n_media, LLAMA_TOKEN_NULL);
-        order.resize(tokens.size(), LLAMA_DECISION_ORDER_IMAGE + (int32_t) k);
-        media_id(1);
-    }
-    for (size_t k = 0; k < media.audios.size(); k++) {
-        // an audio block: "Audio k: <label>\n", <audio start>, the clip's frames (13 per second), <audio end>
-        const auto & aud = media.audios[k];
-        raw(std::string(!state_text.empty() || k > 0 || !media.images.empty() ? "\n\n" : "") + "Audio " + std::to_string(k + 1) + ": " + aud.label + "\n");
-        media_id(5);
-        mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf(mctx, aud.data.data(), aud.data.size(), false, mtmd_helper_init_opt_default()).bitmap);
-        if (!bmp.ptr || !mtmd_bitmap_is_audio(bmp.ptr.get())) {
-            throw std::invalid_argument(string_format("audio[%zu]: not a readable audio file (wav, mp3, flac)", k));
-        }
-        mtmd::input_chunks_ptr chunks(mtmd_input_chunks_init());
-        const std::string m = get_media_marker();
-        mtmd_input_text text = { m.c_str(), m.size(), false, false };
-        const mtmd_bitmap * bptr = bmp.ptr.get();
-        if (mtmd_tokenize(mctx, chunks.get(), &text, &bptr, 1) != 0) {
-            throw std::runtime_error("failed to tokenize an audio clip");
-        }
-        size_t n_media = 0;
-        for (size_t c = 0; c < mtmd_input_chunks_size(chunks.get()); c++) {
-            const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks.get(), c);
-            if (mtmd_input_chunk_get_type(chunk) != MTMD_INPUT_CHUNK_TYPE_TEXT) {
-                n_media += mtmd_input_chunk_get_n_tokens(chunk);
+            media_id(0);
+            std::vector<mtmd::bitmap> bmps;
+            bmps.emplace_back(img.plan.width, img.plan.height, img.stored.data());
+            if (!img.stored2.empty()) {
+                bmps.emplace_back(img.plan.width, img.plan.height, img.stored2.data());
             }
+            std::string m;
+            std::vector<const mtmd_bitmap *> bptr;
+            for (auto & b : bmps) {
+                mtmd_bitmap_set_tilde_scale(b.ptr.get(), (float) img.plan.scale);
+                if (bmps.size() == 2) {
+                    mtmd_bitmap_set_mergeable(b.ptr.get(), true);
+                }
+                m += get_media_marker();
+                bptr.push_back(b.ptr.get());
+            }
+            mtmd::input_chunks_ptr chunks(mtmd_input_chunks_init());
+            mtmd_input_text text = { m.c_str(), m.size(), false, false };
+            if (mtmd_tokenize(mctx, chunks.get(), &text, bptr.data(), bptr.size()) != 0) {
+                throw std::runtime_error("failed to tokenize an image");
+            }
+            const size_t n_media = count_media(chunks);
+            if ((int) n_media != img.layout.n_tokens()) {
+                throw std::runtime_error("image token count differs from its layout");
+            }
+            media_at.emplace_back(tokens.size(), std::move(chunks));
+            tokens.insert(tokens.end(), n_media, LLAMA_TOKEN_NULL);
+            order.resize(tokens.size(), LLAMA_DECISION_ORDER_IMAGE + (int32_t) k);
+            media_id(1);
+        } else {
+            // an audio block: <audio start>, the clip's (or the slice's) frames at 13 per second, <audio end>
+            const auto & aud = media.audios[k];
+            if (!media.stream) {
+                raw(sep + "Audio " + std::to_string(k + 1) + ": " + aud.label + "\n");
+            }
+            media_id(5);
+            // slices of one clip decode it once (the PCM is shared; each slice is a bitmap over it)
+            const raw_buffer * key = aud.data.get();
+            auto it = decoded.find(key);
+            if (it == decoded.end()) {
+                mtmd::bitmap whole(mtmd_helper_bitmap_init_from_buf(mctx, key->data(), key->size(), false, mtmd_helper_init_opt_default()).bitmap);
+                if (!whole.ptr || !mtmd_bitmap_is_audio(whole.ptr.get())) {
+                    throw std::invalid_argument(string_format("audio[%zu]: not a readable audio file (wav, mp3, flac)", k));
+                }
+                const float * pcm = reinterpret_cast<const float *>(whole.data());
+                it = decoded.emplace(key, std::vector<float>(pcm, pcm + whole.n_bytes() / sizeof(float))).first;
+            }
+            // every slice runs the mel of its whole clip: bound the request's total (decoded seconds x slices)
+            mel_seconds += it->second.size() / 16000.0;
+            if (mel_seconds > TILDE_MAX_AUDIO_MEL_SECONDS) {
+                throw std::invalid_argument(string_format("audio: over %.0f s of audio to process (clip length x slices)", TILDE_MAX_AUDIO_MEL_SECONDS));
+            }
+            mtmd::bitmap bmp(mtmd_bitmap_init_from_audio(it->second.size(), it->second.data()));
+            // a distinct id per clip and slice (no chunk cache may confuse two slices of one clip)
+            const std::string id = string_format("tilde-audio-%zx-%zu-%.6f-%.6f",
+                std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char *>(key->data()), key->size())),
+                key->size(), aud.start, aud.end);
+            mtmd_bitmap_set_id(bmp.ptr.get(), id.c_str());
+            if (aud.start >= 0.0) {
+                mtmd_bitmap_set_tilde_audio_slice(bmp.ptr.get(), aud.start, aud.end);
+            }
+            mtmd::input_chunks_ptr chunks(mtmd_input_chunks_init());
+            const std::string m = get_media_marker();
+            mtmd_input_text text = { m.c_str(), m.size(), false, false };
+            const mtmd_bitmap * bptr = bmp.ptr.get();
+            if (mtmd_tokenize(mctx, chunks.get(), &text, &bptr, 1) != 0) {
+                throw std::invalid_argument(string_format("audio[%zu]: could not encode (a slice past the end of the clip?)", k));
+            }
+            const size_t n_media = count_media(chunks);
+            media_at.emplace_back(tokens.size(), std::move(chunks));
+            tokens.insert(tokens.end(), n_media, LLAMA_TOKEN_NULL);
+            order.resize(tokens.size(), LLAMA_DECISION_ORDER_NONE);
+            media_id(6);
         }
-        media_at.emplace_back(tokens.size(), std::move(chunks));
-        tokens.insert(tokens.end(), n_media, LLAMA_TOKEN_NULL);
-        order.resize(tokens.size(), LLAMA_DECISION_ORDER_NONE);
-        media_id(6);
     }
     marker(2);
     raw("\n\nSCHEMA FIELDS:\n");
@@ -1598,11 +1648,6 @@ json server_decision_context::format_answer_tilde(const server_decision_question
 
 // "images": [image, ...], each a data URL / base64 string or {"data": ..., "label": "screenshot", "time": t,
 // "max_cells": n}; "budget_cells": cells for the whole request (default 2400; tilda.vision.budget.allocate)
-// limits on request media (decoded before any token count is known)
-static constexpr size_t TILDE_MEDIA_MAX_CHARS     = 48u << 20;  // base64 characters per image / audio clip
-static constexpr size_t TILDE_IMAGE_MAX_PIXELS    = 40000000;   // per image
-static constexpr size_t TILDE_REQUEST_MAX_PIXELS  = 120000000;  // per request
-
 server_decision_media server_decision_context::parse_media_tilde(const json & body, mtmd_context * mctx) const {
     server_decision_media media;
     // "audio": [clip, ...], each a data URL / base64 string or {"data": ..., "label": "audio"}
@@ -1616,36 +1661,98 @@ server_decision_media server_decision_context::parse_media_tilde(const json & bo
         }
         for (size_t i = 0; i < audio.size(); i++) {
             const json & item = audio.at(i);
-            const json data = item.is_object() ? (item.contains("data") ? item.at("data") : json()) : item;
-            if (!data.is_string()) {
-                throw std::invalid_argument(string_format("audio[%zu]: give a data URL (data:audio/...;base64,...) or base64 data", i));
-            }
-            const std::string url = data.get<std::string>();
-            if (string_starts_with(url, "http") || string_starts_with(url, "file:")) {
-                throw std::invalid_argument(string_format("audio[%zu]: only inline (base64) audio is accepted", i));
-            }
-            if (url.size() > TILDE_MEDIA_MAX_CHARS) {
-                throw std::invalid_argument(string_format("audio[%zu]: over %zu MB of base64", i, TILDE_MEDIA_MAX_CHARS >> 20));
-            }
-            std::vector<raw_buffer> files;
-            handle_media(files, url, "");
             server_decision_media::audio a;
-            a.data = std::move(files[0]);
+            if (item.is_object() && item.contains("clip") && !item.at("clip").is_null()) {
+                // another slice of an earlier item's clip: {"clip": j, "start": .., "end": ..} (the file is sent once)
+                if (!item.at("clip").is_number_integer() || item.at("clip").get<int64_t>() < 0 ||
+                        item.at("clip").get<int64_t>() >= (int64_t) i) {
+                    throw std::invalid_argument(string_format("audio[%zu]: clip is the index of an earlier audio item", i));
+                }
+                a.data = media.audios[item.at("clip").get<size_t>()].data; // shared, not copied
+            } else {
+                const json data = item.is_object() ? (item.contains("data") ? item.at("data") : json()) : item;
+                if (!data.is_string()) {
+                    throw std::invalid_argument(string_format("audio[%zu]: give a data URL (data:audio/...;base64,...) or base64 data", i));
+                }
+                const std::string url = data.get<std::string>();
+                if (string_starts_with(url, "http") || string_starts_with(url, "file:")) {
+                    throw std::invalid_argument(string_format("audio[%zu]: only inline (base64) audio is accepted", i));
+                }
+                if (url.size() > TILDE_MEDIA_MAX_CHARS) {
+                    throw std::invalid_argument(string_format("audio[%zu]: over %zu MB of base64", i, TILDE_MEDIA_MAX_CHARS >> 20));
+                }
+                std::vector<raw_buffer> files;
+                handle_media(files, url, "");
+                a.data = std::make_shared<const raw_buffer>(std::move(files[0]));
+            }
             if (item.is_object() && item.contains("label") && item.at("label").is_string() && !item.at("label").get<std::string>().empty()) {
                 a.label = item.at("label").get<std::string>();
+            }
+            auto number = [&](const char * key, double & out) {
+                if (!item.is_object() || !item.contains(key) || item.at(key).is_null()) {
+                    return false;
+                }
+                if (!item.at(key).is_number() || !std::isfinite(item.at(key).get<double>())) {
+                    throw std::invalid_argument(string_format("audio[%zu]: %s must be a number", i, key));
+                }
+                out = item.at(key).get<double>();
+                return true;
+            };
+            if (i >= TILDE_MAX_AUDIO) {
+                throw std::invalid_argument(string_format("at most %zu audio items", TILDE_MAX_AUDIO));
+            }
+            a.has_time = number("time", a.time);
+            const bool has_start = number("start", a.start), has_end = number("end", a.end);
+            if (has_start != has_end || (has_start && !(a.start >= 0.0 && a.start < a.end && a.end <= 86400.0))) {
+                throw std::invalid_argument(string_format("audio[%zu]: a slice needs 0 <= start < end (seconds)", i));
             }
             media.audios.push_back(std::move(a));
         }
     }
-    if (!body.contains("images") || body.at("images").is_null()) {
+    // the media order and layout (tilda.data: media_order, media_layout)
+    std::string media_order = "auto";
+    if (body.contains("media_order") && !body.at("media_order").is_null()) {
+        media_order = body.at("media_order").is_string() ? body.at("media_order").get<std::string>() : "";
+        if (media_order != "row" && media_order != "time") {
+            throw std::invalid_argument("media_order is \"row\" (images, then audio) or \"time\"");
+        }
+    }
+    if (body.contains("media_layout") && !body.at("media_layout").is_null()) {
+        const std::string layout = body.at("media_layout").is_string() ? body.at("media_layout").get<std::string>() : "";
+        if (layout != "blocks" && layout != "stream") {
+            throw std::invalid_argument("media_layout is \"blocks\" (a header line per block) or \"stream\"");
+        }
+        media.stream = layout == "stream";
+    }
+    auto finish = [&]() {
+        for (size_t k = 0; k < media.images.size(); k++) media.sequence.push_back({ false, k });
+        for (size_t k = 0; k < media.audios.size(); k++) media.sequence.push_back({ true, k });
+        const bool all_timed =
+            std::all_of(media.images.begin(), media.images.end(), [](const auto & m) { return m.has_time; }) &&
+            std::all_of(media.audios.begin(), media.audios.end(), [](const auto & m) { return m.has_time; });
+        if (media_order == "time" && !all_timed) {
+            throw std::invalid_argument("media_order \"time\" needs a time on every image and audio clip");
+        }
+        // auto: by time when every item has one and there are both images and audio (tilda.data._with_audios)
+        if (!media.audios.empty() && (media_order == "time" || (media_order == "auto" && all_timed))) {
+            auto t = [&](const std::pair<bool, size_t> & e) {
+                return e.first ? media.audios[e.second].time : media.images[e.second].time;
+            };
+            std::stable_sort(media.sequence.begin(), media.sequence.end(), [&](const auto & a, const auto & b) {
+                return t(a) < t(b) || (t(a) == t(b) && !a.first && b.first);
+            });
+        }
         return media;
+    };
+    if (!body.contains("images") || body.at("images").is_null()) {
+        return finish();
     }
     const json & images = body.at("images");
     if (!images.is_array()) {
         throw std::invalid_argument("images must be an array");
     }
     if (images.empty()) {
-        return media;
+        return finish();
     }
     if (!tilde_omni) {
         throw std::invalid_argument("this Tilde model is text-only: \"images\" is not supported");
@@ -1670,44 +1777,71 @@ server_decision_media server_decision_context::parse_media_tilde(const json & bo
     size_t total_px = 0;
     for (size_t i = 0; i < images.size(); i++) {
         const json & item = images.at(i);
-        const json data = item.is_object() ? (item.contains("data") ? item.at("data") : json()) : item;
-        if (!data.is_string()) {
-            throw std::invalid_argument(string_format("images[%zu]: give a data URL (data:image/...;base64,...) or base64 data", i));
-        }
-        std::vector<raw_buffer> files;
-        const std::string url = data.get<std::string>();
-        if (string_starts_with(url, "http") || string_starts_with(url, "file:")) {
-            throw std::invalid_argument(string_format("images[%zu]: only inline (base64) images are accepted", i));
-        }
-        if (url.size() > TILDE_MEDIA_MAX_CHARS) {
-            throw std::invalid_argument(string_format("images[%zu]: over %zu MB of base64", i, TILDE_MEDIA_MAX_CHARS >> 20));
-        }
-        handle_media(files, url, "");
-        // the size from the header first: a small, flat PNG can decode to gigabytes
-        int hx = 0, hy = 0;
-        if (!mtmd_helper_image_size(files[0].data(), files[0].size(), &hx, &hy) || hx < 1 || hy < 1) {
-            throw std::invalid_argument(string_format("images[%zu]: not a readable image (jpg, png, bmp, gif)", i));
-        }
-        if ((size_t) hx * hy > TILDE_IMAGE_MAX_PIXELS || total_px + (size_t) hx * hy > TILDE_REQUEST_MAX_PIXELS) {
-            throw std::invalid_argument(string_format("images[%zu]: over %zu Mpx per image or %zu Mpx per request",
-                i, TILDE_IMAGE_MAX_PIXELS / 1000000, TILDE_REQUEST_MAX_PIXELS / 1000000));
-        }
-        mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf(mctx, files[0].data(), files[0].size(), false, mtmd_helper_init_opt_default()).bitmap);
-        if (!bmp.ptr || mtmd_bitmap_is_audio(bmp.ptr.get())) {
-            throw std::invalid_argument(string_format("images[%zu]: not a readable image", i));
-        }
-        files.clear();
-        files.shrink_to_fit();
-        const size_t px = (size_t) bmp.nx() * bmp.ny();
-        total_px += px;
-        if (px > TILDE_IMAGE_MAX_PIXELS || total_px > TILDE_REQUEST_MAX_PIXELS) {
-            throw std::invalid_argument(string_format("images[%zu]: over %zu Mpx per image or %zu Mpx per request",
-                i, TILDE_IMAGE_MAX_PIXELS / 1000000, TILDE_REQUEST_MAX_PIXELS / 1000000));
+        // a still: data; a temporal pair (2 fps video): frames [first, second], one block of the pair's tokens
+        std::vector<json> datas;
+        if (item.is_object() && item.contains("frames") && !item.at("frames").is_null()) {
+            if (!item.at("frames").is_array() || item.at("frames").size() != 2) {
+                throw std::invalid_argument(string_format("images[%zu]: frames is a list of 2 images (a temporal pair)", i));
+            }
+            datas = { item.at("frames").at(0), item.at("frames").at(1) };
+        } else {
+            datas = { item.is_object() ? (item.contains("data") ? item.at("data") : json()) : item };
         }
         server_decision_media::image img;
-        img.width  = (int) bmp.nx();
-        img.height = (int) bmp.ny();
-        img.rgb.assign(bmp.data(), bmp.data() + bmp.n_bytes());
+        for (size_t f = 0; f < datas.size(); f++) {
+            if (!datas[f].is_string()) {
+                throw std::invalid_argument(string_format("images[%zu]: give a data URL (data:image/...;base64,...) or base64 data", i));
+            }
+            std::vector<raw_buffer> files;
+            const std::string url = datas[f].get<std::string>();
+            if (string_starts_with(url, "http") || string_starts_with(url, "file:")) {
+                throw std::invalid_argument(string_format("images[%zu]: only inline (base64) images are accepted", i));
+            }
+            if (url.size() > TILDE_MEDIA_MAX_CHARS) {
+                throw std::invalid_argument(string_format("images[%zu]: over %zu MB of base64", i, TILDE_MEDIA_MAX_CHARS >> 20));
+            }
+            handle_media(files, url, "");
+            // the size from the header first: a small, flat PNG can decode to gigabytes
+            int hx = 0, hy = 0;
+            const auto & fb = files[0];
+            if (fb.size() >= 12 && memcmp(fb.data(), "RIFF", 4) == 0 && memcmp(fb.data() + 8, "WEBP", 4) == 0) {
+                throw server_unsupported_media(string_format("images[%zu]: webp is not supported; send png, jpeg, bmp or gif", i));
+            }
+            if (!mtmd_helper_image_size(files[0].data(), files[0].size(), &hx, &hy) || hx < 1 || hy < 1) {
+                throw std::invalid_argument(string_format("images[%zu]: not a readable image (jpg, png, bmp, gif)", i));
+            }
+            if ((size_t) hx * hy > TILDE_IMAGE_MAX_PIXELS || total_px + (size_t) hx * hy > TILDE_REQUEST_MAX_PIXELS) {
+                throw std::invalid_argument(string_format("images[%zu]: over %zu Mpx per image or %zu Mpx per request",
+                    i, TILDE_IMAGE_MAX_PIXELS / 1000000, TILDE_REQUEST_MAX_PIXELS / 1000000));
+            }
+            mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf(mctx, files[0].data(), files[0].size(), false, mtmd_helper_init_opt_default()).bitmap);
+            if (!bmp.ptr || mtmd_bitmap_is_audio(bmp.ptr.get())) {
+                throw std::invalid_argument(string_format("images[%zu]: not a readable image", i));
+            }
+            files.clear();
+            files.shrink_to_fit();
+            total_px += (size_t) bmp.nx() * bmp.ny();
+            if (f == 0) {
+                img.width  = (int) bmp.nx();
+                img.height = (int) bmp.ny();
+                img.rgb.assign(bmp.data(), bmp.data() + bmp.n_bytes());
+            } else {
+                if ((int) bmp.nx() != img.width || (int) bmp.ny() != img.height) {
+                    throw std::invalid_argument(string_format("images[%zu]: the two frames differ in size", i));
+                }
+                img.rgb2.assign(bmp.data(), bmp.data() + bmp.n_bytes());
+            }
+        }
+        if (item.is_object() && item.contains("stored_scale") && !item.at("stored_scale").is_null()) {
+            // already at its stored size (e.g. video frames scaled by the client): no resize; the scale is the
+            // stored pixels per original pixel (position features, original-pixel answers)
+            if (!item.at("stored_scale").is_number() || !(item.at("stored_scale").get<double>() > 0.0) ||
+                    item.at("stored_scale").get<double>() > 1.0) {
+                throw std::invalid_argument(string_format("images[%zu]: stored_scale is in (0, 1]", i));
+            }
+            img.prestored = true;
+            img.prestored_scale = item.at("stored_scale").get<double>();
+        }
         int cap = tilde_omni::MAX_CELLS;
         if (item.is_object()) {
             if (item.contains("label") && item.at("label").is_string() && !item.at("label").get<std::string>().empty()) {
@@ -1743,16 +1877,33 @@ server_decision_media server_decision_context::parse_media_tilde(const json & bo
         }
         auto & img = media.images[i];
         img.plan   = plans[i];
+        if (img.prestored) {
+            // as given (padded to 32 px cells), with the client's scale
+            img.plan = tilde_omni::make_plan(img.width, img.height, 1.0);
+            img.plan.scale = img.prestored_scale;
+            if (img.plan.cells() > std::min(caps[i], tilde_omni::MAX_CELLS)) {
+                throw std::invalid_argument(string_format("images[%zu]: a stored_scale image is over %d cells of 32 px",
+                    i, std::min(caps[i], tilde_omni::MAX_CELLS)));
+            }
+        }
         img.stored = tilde_omni::render(img.rgb, img.width, img.height, img.plan);
         img.rgb.clear();
         img.rgb.shrink_to_fit();
-        std::vector<int32_t> toc((size_t) (img.plan.width / 32) * (img.plan.height / 32));
-        if (mtmd_tilde_merge_cells(img.stored.data(), img.plan.width, img.plan.height, toc.data()) < 0) {
-            throw std::runtime_error("blank merging failed");
+        std::vector<int32_t> toc;
+        if (!img.rgb2.empty()) {
+            // a temporal pair keeps every cell (tilda.qwen35.model.online: motion may sit in a flat cell)
+            img.stored2 = tilde_omni::render(img.rgb2, img.width, img.height, img.plan);
+            img.rgb2.clear();
+            img.rgb2.shrink_to_fit();
+        } else {
+            toc.resize((size_t) (img.plan.width / 32) * (img.plan.height / 32));
+            if (mtmd_tilde_merge_cells(img.stored.data(), img.plan.width, img.plan.height, toc.data()) < 0) {
+                throw std::runtime_error("blank merging failed");
+            }
         }
         img.layout = tilde_omni::layout::make(img.plan.height / 32, img.plan.width / 32, std::move(toc));
     }
-    return media;
+    return finish();
 }
 
 // Python's round(v, digits): the exact binary value rounded half-even to the decimal digits (printf does that)

@@ -84,6 +84,8 @@ def _decl_pixels(root: Path, entry: dict, fixed: Path) -> list[str]:
 def cmd_run(args) -> None:
     for key in ("base", "checkpoint", "subsets", "enc", "media_root", "out"):
         setattr(args, key, getattr(args, key).resolve())  # before the chdir below
+    if args.unfolded_head is not None:
+        args.unfolded_head = args.unfolded_head.resolve()
     tilda_path()
     os.chdir(os.environ["TILDA_CODE"])  # recipe / base identity paths are relative to the code
     import torch
@@ -146,10 +148,14 @@ def cmd_run(args) -> None:
                                       "rows": entry["rows"], "cols": entry["cols"]})
                         image_index += 1
                 questions = []
-                for q, ex in zip(record.questions, record.examples, strict=True):
+                point_rows = {getattr(p, "row_index", None) for p in record.points}
+                row_ids = [i for i in (record.row_indices or []) if i not in point_rows]
+                if len(row_ids) != len(record.questions):
+                    row_ids = [None] * len(record.questions)
+                for q, ex, ri in zip(record.questions, record.examples, row_ids, strict=True):
                     questions.append({"type": int(q.question_type), "span": list(q.question_span),
                                       "options": [list(s) for s in q.option_spans], "target": list(ex.target),
-                                      "kind": ex.kind})
+                                      "kind": ex.kind, "uid": None if ri is None else rows[ri].get("uid")})
                 points = []
                 for p in record.points:
                     image = point_image(p.example)
@@ -161,7 +167,8 @@ def cmd_run(args) -> None:
                         tokens = point_targets(spec, image, tok)["tokens"]
                     questions.append({"type": 3, "span": list(p.question_span), "options": [[p.none_position, p.none_position + 1]],
                                       "target": [1.0], "kind": "point", "image": p.image_index,
-                                      "query": p.query_position})
+                                      "query": p.query_position,
+                                      "uid": rows[p.row_index].get("uid") if getattr(p, "row_index", None) is not None else None})
                     points.append({"question": len(questions) - 1, "box": None if spec.box is None else list(spec.box),
                                    "targets": tokens, "image": p.image_index, "image_start": layout_of["start"]})
                 order = sorted(range(len(questions)), key=lambda i: questions[i]["span"][0])

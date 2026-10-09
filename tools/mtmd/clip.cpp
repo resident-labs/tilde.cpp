@@ -4385,6 +4385,9 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
             {
                 // the valid frames only: a partial last chunk gives fewer tokens (padding is dropped, as the reference)
                 n_patches = img->tilde_tokens > 0 ? img->tilde_tokens : (img->nx() / 100) * 13;
+                if (img->tilde_keep_n >= 0) {
+                    n_patches = img->tilde_keep_n;
+                }
             } break;
         case PROJECTOR_TYPE_QWEN3A:
             {

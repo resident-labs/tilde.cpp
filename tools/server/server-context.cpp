@@ -5793,6 +5793,8 @@ void server_routes::init_routes() {
                 }
             }
             return res;
+        } catch (const server_unsupported_media & e) {
+            return plain_error(415, e.what());
         } catch (const std::invalid_argument & e) {
             return plain_error(400, e.what());
         } catch (const common_json_error & e) {

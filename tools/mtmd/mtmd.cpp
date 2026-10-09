@@ -23,11 +23,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <climits>
+#include <cmath>
 #include <type_traits>
 #include <vector>
 
 // remember to bump this if the serialization format changes
-#define MTMD_SERIALIZATION_VERSION 3
+#define MTMD_SERIALIZATION_VERSION 4
 
 struct mtmd_serialization {
     // note: using 64-bit here for future-proofing
@@ -109,6 +110,8 @@ void clip_image_f32::serialize(mtmd_serialization & ser) const {
     ser.write((int32_t)nx_);
     ser.write((int32_t)ny_);
     ser.write(tilde_tokens);
+    ser.write(tilde_keep_first);
+    ser.write(tilde_keep_n);
 }
 void clip_image_f32::deserialize(mtmd_serialization & ser) {
     add_viewsep = ser.read<bool>();
@@ -117,6 +120,8 @@ void clip_image_f32::deserialize(mtmd_serialization & ser) {
     nx_ = ser.read<int32_t>();
     ny_ = ser.read<int32_t>();
     tilde_tokens = ser.read<int32_t>();
+    tilde_keep_first = ser.read<int32_t>();
+    tilde_keep_n = ser.read<int32_t>();
     buf.clear(); // always a placeholder after loading
 }
 
@@ -131,7 +136,7 @@ void clip_image_f32_batch::serialize(mtmd_serialization & ser) const {
 void clip_image_f32_batch::deserialize(mtmd_serialization & ser) {
     is_audio = ser.read<bool>();
     uint64_t n = ser.read<uint64_t>();
-    constexpr size_t min_entry_bytes = sizeof(uint8_t) * 2 + sizeof(int32_t) * 4;
+    constexpr size_t min_entry_bytes = sizeof(uint8_t) * 2 + sizeof(int32_t) * 6;
     if (n > (ser.data.size() - ser.read_pos) / min_entry_bytes) {
         throw std::runtime_error("entries count exceeds buffer size");
     }
@@ -153,6 +158,10 @@ struct mtmd_bitmap {
     uint32_t nx = 0;
     uint32_t ny = 0;
     float tilde_scale = 1.0f; // tilde omni: stored pixels per original pixel
+    // tilde omni audio: a slice of the clip in seconds (start < 0: the whole clip); the clip is encoded whole and
+    // the tokens of [start, end) at 13 per second are kept (tilda.audio.common.AudioRef.frame_span)
+    double tilde_slice_start = -1.0;
+    double tilde_slice_end   = -1.0;
     std::string id; // optional user-defined id, for ex: can be set to image hash, useful for KV cache tracking
     bool is_audio = false; // true if the bitmap is audio
     bool mergeable = false; // [QWEN_VIDEO] set only on frames of the same video
@@ -1635,6 +1644,25 @@ struct mtmd_tokenizer {
                 }
             }
 
+            // tilde omni: a slice of the clip keeps tokens [slice_a, slice_b) over the whole clip's windows
+            int64_t slice_a = 0, slice_b = INT64_MAX, tok_off = 0;
+            if (bitmap->tilde_slice_start >= 0.0) {
+                int64_t total = 0;
+                for (const auto & mel_spec : mel_spec_chunks) {
+                    total += clip_tilde_audio_tokens((int) mel_spec.n_len_org);
+                }
+                constexpr double rate = 13.0; // tokens per second (the store's frame_rate_hz)
+                auto at = [&](double s) { // floor(s * rate + 0.5) clamped to [0, total], as doubles before the cast
+                    return (int64_t) std::min((double) total, std::max(0.0, std::floor(s * rate + 0.5)));
+                };
+                slice_a = at(bitmap->tilde_slice_start);
+                slice_b = std::max(slice_a, at(bitmap->tilde_slice_end));
+                if (slice_b <= slice_a) {
+                    LOG_ERR("%s: error: the audio slice [%g, %g) s holds no tokens\n", __func__, bitmap->tilde_slice_start, bitmap->tilde_slice_end);
+                    return 2;
+                }
+            }
+
             // consider each mel_spec as a separate audio chunk
             // TODO: maybe support batching, but this may come with memory cost
             for (auto & mel_spec : mel_spec_chunks) {
@@ -1649,6 +1677,16 @@ struct mtmd_tokenizer {
                     is_placeholder, /* is_audio */ true);
                 mel_f32.cpy_buf(mel_spec.data);
                 mel_f32.tilde_tokens = clip_tilde_audio_tokens((int) mel_spec.n_len_org);
+                if (bitmap->tilde_slice_start >= 0.0) {
+                    const int64_t n_win = mel_f32.tilde_tokens;
+                    const int64_t lo = std::max(slice_a, tok_off), hi = std::min(slice_b, tok_off + n_win);
+                    tok_off += n_win;
+                    if (lo >= hi) {
+                        continue; // a window outside the slice
+                    }
+                    mel_f32.tilde_keep_first = (int32_t) (lo - (tok_off - n_win));
+                    mel_f32.tilde_keep_n     = (int32_t) (hi - lo);
+                }
 
                 size_t n_tokens = clip_n_output_tokens(ctx->ctx_a, &mel_f32);
 
@@ -2305,6 +2343,11 @@ void mtmd_bitmap_set_id(mtmd_bitmap * bitmap, const char * id) {
     } else {
         bitmap->id.clear();
     }
+}
+
+void mtmd_bitmap_set_tilde_audio_slice(mtmd_bitmap * bitmap, double start, double end) {
+    bitmap->tilde_slice_start = start;
+    bitmap->tilde_slice_end   = end;
 }
 
 void mtmd_bitmap_set_tilde_scale(mtmd_bitmap * bitmap, float scale) {

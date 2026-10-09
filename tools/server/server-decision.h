@@ -6,6 +6,7 @@
 #include "tilde-omni-point.h"
 
 #include <map>
+#include <stdexcept>
 #include <memory>
 #include <string>
 #include <vector>
@@ -40,6 +41,11 @@ struct server_decision_question {
 };
 
 // tilde omni: the images of a request, as stored for the model (tilda.vision.budget) and their token layouts
+// a media format the server does not decode (HTTP 415)
+struct server_unsupported_media : std::invalid_argument {
+    using std::invalid_argument::invalid_argument;
+};
+
 struct server_decision_media {
     struct image {
         std::string          label = "screenshot";
@@ -48,17 +54,29 @@ struct server_decision_media {
         int                  width = 0;  // original pixels
         int                  height = 0;
         std::vector<uint8_t> rgb;        // original pixels, then released once stored
+        std::vector<uint8_t> rgb2;       // the second frame of a temporal pair (video), empty for a still
+        bool                 prestored = false; // given at its stored size with its scale (no resize)
+        double               prestored_scale = 1.0;
         tilde_omni::plan     plan;
         std::vector<uint8_t> stored;     // plan.width x plan.height x 3
+        std::vector<uint8_t> stored2;    // the pair's second frame
         tilde_omni::layout   layout;
     };
     std::vector<image> images;
     // audio clips, after the images (tilda.data.parse_row); whole clips, "Audio k: <label>"
     struct audio {
         std::string label = "audio";
-        raw_buffer  data;   // the file (wav / mp3 / flac)
+        std::shared_ptr<const raw_buffer> data; // the file (wav / mp3 / flac), shared by the slices of one clip
+        bool        has_time = false;
+        double      time  = 0.0;
+        double      start = -1.0; // a slice of the clip in seconds (start < 0: the whole clip)
+        double      end   = -1.0;
     };
     std::vector<audio> audios;
+    // the order of the media blocks: (false, image k) / (true, audio k); images then audio by default, by time
+    // (an image before a clip at equal time) when every item has a time or media_order is "time"
+    std::vector<std::pair<bool, size_t>> sequence;
+    bool stream = false; // media_layout "stream": no header line per block (Qwen-style video)
 };
 
 struct server_decision_context {

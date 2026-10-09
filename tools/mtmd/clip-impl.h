@@ -704,6 +704,10 @@ struct clip_image_f32 {
     std::vector<int32_t> tilde_token_of_cell;
     int32_t tilde_tokens = 0;
     float   tilde_scale  = 1.0f;
+    // tilde omni audio: only tokens [tilde_keep_first, tilde_keep_first + tilde_keep_n) of this window are output
+    // (a slice of a clip, tilda.audio.common.AudioRef.frame_span); tilde_keep_n < 0: all of them
+    int32_t tilde_keep_first = 0;
+    int32_t tilde_keep_n     = -1;
 
     clip_image_size get_size() const {
         return { nx_, ny_ };

@@ -187,6 +187,8 @@ MTMD_API void         mtmd_bitmap_set_id(mtmd_bitmap * bitmap, const char * id);
 
 // tilde omni: stored image pixels per original pixel (default 1), read by the vision bridge
 MTMD_API void         mtmd_bitmap_set_tilde_scale(mtmd_bitmap * bitmap, float scale);
+// tilde omni audio: encode the whole clip, keep the tokens of [start, end) seconds (13 per second); start < 0: all
+MTMD_API void         mtmd_bitmap_set_tilde_audio_slice(mtmd_bitmap * bitmap, double start, double end);
 
 // tilde omni blank merging (tilda.vision.merge.merge_cells): the image token of each 32 px cell of an RGB image whose
 // sides are multiples of 32, row-major (token_of_cell must hold (nx / 32) * (ny / 32) entries); returns the number of

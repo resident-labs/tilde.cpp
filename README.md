@@ -228,9 +228,16 @@ Request additions (tilde omni):
   `p_none`, `p_token`, `p_blob`, `p_elsewhere`, `width`, `height`, `top` (8 most likely tokens), `p_blob_t` and
   `stored_xy`, as the reference browser server (tilda.agents.browser.serve) does; the response adds `images` (scale,
   stored size and tokens of each image).
-- Layout: the state, then every image (in request order), then every audio clip, then the questions. The training rows
-  interleave media by time; a request that mixes images and audio always gets images first.
-- Limits: 48 MB of base64 per image or clip, 40 Mpx per image, 120 Mpx per request, 32 images.
+- Media order: `media_order` `"time"` (images and clips sorted by their `time`, an image before a clip at equal
+  time, as the training rows with `"media_order": "time"`), `"row"` (every image, then every clip). Default: by time
+  when every image and clip has a `time`, else row. `media_layout`: `"blocks"` (default; a header line per block,
+  `Image k: <label>` / `Audio k: <label>`) or `"stream"` (no header lines; Qwen-style video).
+- Video: an image item with `"frames": [first, second]` is one temporal pair (2 fps); `"stored_scale": s` marks an
+  image already at its stored size (s = stored / original pixels; no resize). Audio items take `time` and a slice
+  `start` / `end` in seconds (the whole clip is encoded once per window and the slice's tokens kept, 13 per second); `"clip": j`
+  instead of `data` takes the file of audio item j (send a clip once, slice it many times).
+- webp images get HTTP 415.
+- Limits: 48 MB of base64 per image or clip, 40 Mpx per image, 120 Mpx per request, 32 images, 256 audio items, 3,600 s of audio to process (clip length summed over its slices).
 
 ## License
 

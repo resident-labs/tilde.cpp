@@ -186,6 +186,11 @@ ggml_cgraph * clip_graph_tilde_omni_a::build() {
     cur = build_ffn(cur, model.mm_1_w, model.mm_1_b, nullptr, nullptr, model.mm_2_w, model.mm_2_b, FFN_GELU_ERF, -1);
     cur = ggml_add(ctx0, ggml_mul_mat(ctx0, model.tilde_lin_w, cur), model.tilde_lin_b);
     cur = ggml_pad(ctx0, cur, 512, 0, 0, 0);
+    if (img.tilde_keep_n >= 0) {
+        // a slice of the clip: the window is encoded whole (its attention sees every frame), the kept tokens output
+        GGML_ASSERT(img.tilde_keep_first >= 0 && img.tilde_keep_first + img.tilde_keep_n <= cur->ne[1] && img.tilde_keep_n > 0);
+        cur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, cur->ne[0], img.tilde_keep_n, cur->nb[1], (size_t) img.tilde_keep_first * cur->nb[1]));
+    }
     cb(cur, "tilde_out", -1);
 
     ggml_build_forward_expand(gf, cur);
