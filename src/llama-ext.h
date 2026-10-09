@@ -110,6 +110,11 @@ enum llama_decision_order {
     LLAMA_DECISION_ORDER_QUESTION_CHOICE = 2,
     LLAMA_DECISION_ORDER_QUESTION_SCORE  = 3,
     LLAMA_DECISION_ORDER_OPTION          = 4, // text of an option
+    // tilde_omni: the tokens of image k (32 + k), and the text of a point question about image k (64 + k), k < 32
+    // a point question's option is its <point none> marker; the point head reads image k's tokens and that marker
+    LLAMA_DECISION_ORDER_IMAGE           = 32,
+    LLAMA_DECISION_ORDER_QUESTION_POINT  = 64,
+    LLAMA_DECISION_ORDER_MAX_IMAGES      = 32,
 };
 // The embeddings output has one value per entry: row i is the score of option i
 LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch, int32_t idx, enum llama_decision_order order);

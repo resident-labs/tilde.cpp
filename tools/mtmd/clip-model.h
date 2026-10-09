@@ -607,6 +607,19 @@ struct clip_model {
     ggml_tensor * mm_0_b = nullptr;
     ggml_tensor * mm_2_w = nullptr;
     ggml_tensor * mm_2_b = nullptr;
+    // tilde omni: the trained vision bridge, the point head's sub-patch keys, the audio bridge
+    ggml_tensor * tilde_lin_w = nullptr;
+    ggml_tensor * tilde_lin_b = nullptr;
+    ggml_tensor * tilde_mlp0_w = nullptr;
+    ggml_tensor * tilde_mlp0_b = nullptr;
+    ggml_tensor * tilde_mlp2_w = nullptr;
+    ggml_tensor * tilde_mlp2_b = nullptr;
+    ggml_tensor * tilde_pos_w = nullptr;
+    ggml_tensor * tilde_pos_b = nullptr;
+    ggml_tensor * tilde_sub_key_norm_w = nullptr;
+    ggml_tensor * tilde_sub_key_norm_b = nullptr;
+    ggml_tensor * tilde_sub_key_w = nullptr;
+
     ggml_tensor * mm_merger_fc1_w = nullptr;   // minimax-m3
     ggml_tensor * mm_merger_fc1_b = nullptr;
     ggml_tensor * mm_merger_fc2_w = nullptr;

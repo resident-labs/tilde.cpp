@@ -6,12 +6,20 @@
 // Output: JSON lines {"id": ..., "n_tokens": N, "ms": ..., "logits": [[...], ...]} (one list per question).
 //
 // This is the parity harness: the records come from the reference encoder, so the comparison isolates the model.
+//
+// Tilde Omni media records (--mmproj, tilde/parity/reference_omni_media.py): questions may be point fields (type 3,
+// with "image"), and "media" lists the image / audio blocks [{kind, start, tokens, paths | path + frames, scale}];
+// their token positions take the mmproj's embeddings. The output then also has "points": per point field its token
+// logits [none, image tokens...], the 4 + 36 + 2 values at its best token, and the decoded click.
 
 #include "arg.h"
 #include "common.h"
 #include "llama.h"
 #include "llama-cpp.h"
 #include "../../src/llama-ext.h"
+#include "mtmd.h"
+#include "mtmd-helper.h"
+#include "tilde-omni-point.h"
 
 #include <nlohmann/json.hpp>
 
@@ -34,8 +42,10 @@ struct record {
         int type;
         int start, end;
         std::vector<std::pair<int, int>> options;
+        int image = -1; // point fields: the image index
     };
     std::vector<question> questions;
+    json media; // tilde omni media blocks (null if none)
 };
 
 static record parse_record(const json & j) {
@@ -52,7 +62,13 @@ static record parse_record(const json & j) {
         for (const auto & o : q.at("options")) {
             qq.options.push_back({ o[0].get<int>(), o[1].get<int>() });
         }
+        if (q.contains("image")) {
+            qq.image = q.at("image").get<int>();
+        }
         r.questions.push_back(std::move(qq));
+    }
+    if (j.contains("media")) {
+        r.media = j.at("media");
     }
     return r;
 }
@@ -95,11 +111,11 @@ static bool profile_cb(struct ggml_tensor * t, bool ask, void * user_data) {
 static void usage(const char * argv0) {
     fprintf(stderr,
         "usage: %s -m MODEL.gguf --records IN.jsonl --out OUT.jsonl [-ngl N] [-t THREADS] [-fa on|off|auto]\n"
-        "          [--max-tokens N] [--limit N] [--repeat N] [--profile] [--experts N]\n", argv0);
+        "          [--max-tokens N] [--limit N] [--repeat N] [--profile] [--experts N] [--mmproj MMPROJ.gguf]\n", argv0);
 }
 
 int main(int argc, char ** argv) {
-    std::string model_path, records_path, out_path, fa = "auto";
+    std::string model_path, records_path, out_path, fa = "auto", mmproj_path;
     int ngl = 999, threads = -1, max_tokens = 0, limit = -1, repeat = 1, experts = 0;
     bool do_profile = false;
     for (int i = 1; i < argc; i++) {
@@ -119,6 +135,7 @@ int main(int argc, char ** argv) {
         else if (a == "--repeat") repeat = std::stoi(next());
         else if (a == "--profile") do_profile = true;
         else if (a == "--experts") experts = std::stoi(next()); // routed experts per token (default: the model's)
+        else if (a == "--mmproj") mmproj_path = next();
         else { usage(argv[0]); return 1; }
     }
     if (model_path.empty() || records_path.empty() || out_path.empty()) {
@@ -184,10 +201,27 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    mtmd::context_ptr mctx;
+    if (!mmproj_path.empty()) {
+        auto mparams = mtmd_context_params_default();
+        mparams.use_gpu         = ngl > 0;
+        mparams.print_timings   = false;
+        mparams.flash_attn_type = cparams.flash_attn_type;
+        if (threads > 0) {
+            mparams.n_threads = threads;
+        }
+        mctx.reset(mtmd_init_from_file(mmproj_path.c_str(), model.get(), mparams));
+        if (!mctx) {
+            fprintf(stderr, "failed to load %s\n", mmproj_path.c_str());
+            return 1;
+        }
+    }
+    const int32_t n_embd_inp = llama_model_n_embd_inp(model.get());
+
     std::ofstream out(out_path);
     common_batch batch(ctx.get());
     double total_ms = 0;
-    for (const auto & r : records) {
+    for (auto & r : records) {
         if ((int) r.ids.size() > max_tokens) {
             fprintf(stderr, "%s: %zu tokens > %d, skipped\n", r.id.c_str(), r.ids.size(), max_tokens);
             continue;
@@ -212,18 +246,133 @@ int main(int argc, char ** argv) {
         std::vector<int32_t> order(r.ids.size(), LLAMA_DECISION_ORDER_NONE);
         size_t n_options = 0;
         for (const auto & q : r.questions) {
-            for (int t = q.start; t < q.end; t++) order[t] = LLAMA_DECISION_ORDER_QUESTION_NOUL + q.type;
+            const int32_t q_order = q.type == 3 ? LLAMA_DECISION_ORDER_QUESTION_POINT + q.image : LLAMA_DECISION_ORDER_QUESTION_NOUL + q.type;
+            for (int t = q.start; t < q.end; t++) order[t] = q_order;
             for (const auto & o : q.options) {
                 for (int t = o.first; t < o.second; t++) order[t] = LLAMA_DECISION_ORDER_OPTION;
                 n_options++;
             }
+        }
+
+        // media blocks: the mmproj's embeddings at their token positions (tilde omni)
+        std::vector<float> embd;                       // n_embd_inp per media token
+        std::vector<int32_t> embd_row(r.ids.size(), -1);
+        std::vector<tilde_omni::layout> layouts;       // per image index
+        bool media_ok = true;
+        double media_ms = 0;
+        if (!r.media.is_null() && !r.media.empty()) {
+            if (!mctx) {
+                fprintf(stderr, "%s: media records need --mmproj\n", r.id.c_str());
+                return 1;
+            }
+            const auto m0 = std::chrono::steady_clock::now();
+            for (const auto & m : r.media) {
+                const std::string kind = m.at("kind").get<std::string>();
+                const int start  = m.at("start").get<int>();
+                const int n_tok  = m.at("tokens").get<int>();
+                std::vector<mtmd::bitmap> bitmaps;
+                std::string prompt;
+                if (kind == "image") {
+                    for (const auto & p : m.at("paths")) {
+                        auto w = mtmd_helper_bitmap_init_from_file(mctx.get(), p.get<std::string>().c_str(), false, {});
+                        if (!w.bitmap) {
+                            fprintf(stderr, "%s: cannot read %s\n", r.id.c_str(), p.get<std::string>().c_str());
+                            return 1;
+                        }
+                        mtmd_bitmap_set_tilde_scale(w.bitmap, m.value("scale", 1.0f));
+                        if (m.at("paths").size() == 2) {
+                            mtmd_bitmap_set_mergeable(w.bitmap, true);
+                        }
+                        bitmaps.emplace_back(w.bitmap);
+                        prompt += mtmd_default_marker();
+                    }
+                    const int rows = m.at("rows").get<int>(), cols = m.at("cols").get<int>();
+                    std::vector<int32_t> toc;
+                    if (bitmaps.size() == 1) {
+                        toc.resize((size_t) rows * cols);
+                        mtmd_tilde_merge_cells(mtmd_bitmap_get_data(bitmaps[0].ptr.get()), mtmd_bitmap_get_nx(bitmaps[0].ptr.get()),
+                                mtmd_bitmap_get_ny(bitmaps[0].ptr.get()), toc.data());
+                    }
+                    const int k = m.at("image").get<int>();
+                    if ((int) layouts.size() <= k) layouts.resize(k + 1);
+                    layouts[k] = tilde_omni::layout::make(rows, cols, std::move(toc));
+                    for (int t = start; t < start + n_tok; t++) order[t] = LLAMA_DECISION_ORDER_IMAGE + k;
+                } else if (kind == "audio") {
+                    auto w = mtmd_helper_bitmap_init_from_file(mctx.get(), m.at("path").get<std::string>().c_str(), false, {});
+                    if (!w.bitmap || !mtmd_bitmap_is_audio(w.bitmap)) {
+                        fprintf(stderr, "%s: cannot read audio %s\n", r.id.c_str(), m.at("path").get<std::string>().c_str());
+                        return 1;
+                    }
+                    bitmaps.emplace_back(w.bitmap);
+                    prompt += mtmd_default_marker();
+                    // the block markers of audio are the audio ones (the reference fills the image start / end
+                    // placeholders with the audio module's markers)
+                    const int32_t audio_start_id = llama_vocab_n_tokens(llama_model_get_vocab(model.get())) - 2;
+                    r.ids.at(start - 1)     = audio_start_id;
+                    r.ids.at(start + n_tok) = audio_start_id + 1;
+                } else {
+                    fprintf(stderr, "%s: media kind %s is not supported\n", r.id.c_str(), kind.c_str());
+                    media_ok = false;
+                    break;
+                }
+                mtmd::input_chunks chunks(mtmd_input_chunks_init());
+                mtmd_input_text text = { prompt.c_str(), prompt.size(), false, false };
+                std::vector<const mtmd_bitmap *> bptr;
+                for (auto & b : bitmaps) bptr.push_back(b.ptr.get());
+                if (mtmd_tokenize(mctx.get(), chunks.ptr.get(), &text, bptr.data(), bptr.size()) != 0) {
+                    fprintf(stderr, "%s: mtmd_tokenize failed\n", r.id.c_str());
+                    return 1;
+                }
+                // every media chunk in order (an audio clip is several 8 s windows), embeddings concatenated
+                std::vector<float> clip_embd;
+                for (size_t c = 0; c < chunks.size(); c++) {
+                    if (mtmd_input_chunk_get_type(chunks[c]) == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+                        continue;
+                    }
+                    if (mtmd_encode_chunk(mctx.get(), chunks[c]) != 0) {
+                        fprintf(stderr, "%s: mtmd_encode_chunk failed\n", r.id.c_str());
+                        return 1;
+                    }
+                    const float * e = mtmd_get_output_embd(mctx.get());
+                    clip_embd.insert(clip_embd.end(), e, e + mtmd_input_chunk_get_n_tokens(chunks[c]) * n_embd_inp);
+                }
+                const int n_clip = (int) (clip_embd.size() / n_embd_inp);
+                // an audio block may be a slice of its clip's encoding ([a, b) frames)
+                int a = 0, b = n_clip;
+                if (kind == "audio") {
+                    if (n_clip != m.at("clip_frames").get<int>()) {
+                        fprintf(stderr, "%s: audio clip has %d frames, the reference %d\n", r.id.c_str(), n_clip, m.at("clip_frames").get<int>());
+                        return 1;
+                    }
+                    a = m.at("frames")[0].get<int>();
+                    b = m.at("frames")[1].get<int>();
+                }
+                if (b - a != n_tok) {
+                    fprintf(stderr, "%s: media block has %d tokens, the record %d\n", r.id.c_str(), b - a, n_tok);
+                    return 1;
+                }
+                for (int t = 0; t < n_tok; t++) {
+                    embd_row[start + t] = (int32_t) (embd.size() / n_embd_inp);
+                    embd.insert(embd.end(), clip_embd.begin() + (size_t) (a + t) * n_embd_inp, clip_embd.begin() + (size_t) (a + t + 1) * n_embd_inp);
+                }
+            }
+            media_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - m0).count();
+        }
+        if (!media_ok) {
+            continue;
         }
         std::vector<float> scores;
         double ms = 0;
         for (int rep = 0; rep < repeat; rep++) {
             batch.clear();
             for (size_t i = 0; i < r.ids.size(); i++) {
-                const int32_t idx = batch.add(r.ids[i], (llama_pos) i, 0, true);
+                int32_t idx;
+                if (embd_row[i] >= 0) {
+                    const llama_pos pos[4] = { (llama_pos) i, 0, 0, 0 };
+                    idx = batch.add_embd({ embd.data() + (size_t) embd_row[i] * n_embd_inp, 1, (size_t) n_embd_inp }, pos, 0, true);
+                } else {
+                    idx = batch.add(r.ids[i], (llama_pos) i, 0, true);
+                }
                 batch.tokens[idx].decision_order = order[i];
             }
             // profile the last repetition only
@@ -239,8 +388,14 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "%s: llama_process failed (%d)\n", r.id.c_str(), ret);
                 return 1;
             }
-            const float * embd = llama_get_embeddings(ctx.get());
-            scores.assign(embd, embd + n_options);
+            const float * out_embd = llama_get_embeddings(ctx.get());
+            size_t n_read = n_options;
+            for (const auto & q : r.questions) {
+                if (q.type == 3) {
+                    n_read += 1 + layouts.at(q.image).n_tokens() + tilde_omni::POINT_EXTRA;
+                }
+            }
+            scores.assign(out_embd, out_embd + n_read);
             const auto t1 = std::chrono::steady_clock::now();
             ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         }
@@ -252,7 +407,25 @@ int main(int argc, char ** argv) {
             for (size_t j = 0; j < q.options.size(); j++) row.push_back(scores[k++]);
             logits.push_back(row);
         }
+        json points = json::array();
+        for (const auto & q : r.questions) {
+            if (q.type != 3) continue;
+            const auto & lay = layouts.at(q.image);
+            const float * po = scores.data() + k;
+            const auto c = tilde_omni::decode(po, lay);
+            const int n = lay.n_tokens();
+            points.push_back({{"token_logits", std::vector<float>(po, po + 1 + n)}, {"best", c.token},
+                              {"sub_logits", std::vector<float>(po + 1 + n, po + 1 + n + 4)},
+                              {"location", std::vector<float>(po + 1 + n + 4, po + 1 + n + 40)},
+                              {"size", std::vector<float>(po + 1 + n + 40, po + 1 + n + 42)},
+                              {"click", {c.x, c.y}}, {"none", c.none}, {"p_none", c.p_none}});
+            k += 1 + n + tilde_omni::POINT_EXTRA;
+        }
         json row = {{"id", r.id}, {"n_tokens", r.ids.size()}, {"ms", ms}, {"logits", logits}};
+        if (!r.media.is_null()) {
+            row["points"]   = points;
+            row["media_ms"] = media_ms;
+        }
         if (do_profile) {
             row["profile_by_op"]   = prof.by_op;
             row["profile_by_role"] = prof.by_role;

@@ -616,6 +616,7 @@ class MODEL_ARCH(IntEnum):
     BAILINGMOE2      = auto()
     BAILINGMOE3      = auto()
     TILDE            = auto()
+    TILDE_OMNI       = auto()
     DOTS1            = auto()
     DOTS3NOTE        = auto()
     ARCEE            = auto()
@@ -908,6 +909,16 @@ class MODEL_TENSOR(IntEnum):
     DECISION_SCALES               = auto()
     DECISION_SCORER               = auto()
     DECISION_SCORER_OUT           = auto()
+    POINT_QUERY_NORM                = auto()
+    POINT_QUERY                     = auto()
+    POINT_KEY_NORM                  = auto()
+    POINT_KEY                       = auto()
+    POINT_PAIR_NORM                 = auto()
+    POINT_SUB_QUERY                 = auto()
+    POINT_SIZE_UP                   = auto()
+    POINT_SIZE_DOWN                 = auto()
+    POINT_LOC_UP                    = auto()
+    POINT_LOC_DOWN                  = auto()
     CONV1D               = auto()
     CONVNEXT_DW          = auto()
     CONVNEXT_NORM        = auto()
@@ -1400,6 +1411,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.BAILINGMOE2:      "bailingmoe2",
     MODEL_ARCH.BAILINGMOE3:      "bailingmoe3",
     MODEL_ARCH.TILDE:            "tilde",
+    MODEL_ARCH.TILDE_OMNI:       "tilde_omni",
     MODEL_ARCH.DOTS1:            "dots1",
     MODEL_ARCH.DOTS3NOTE:        "dots3note",
     MODEL_ARCH.ARCEE:            "arcee",
@@ -1691,6 +1703,16 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DECISION_SCALES:               "decision.scales",
     MODEL_TENSOR.DECISION_SCORER:               "decision.scorer",
     MODEL_TENSOR.DECISION_SCORER_OUT:           "decision.scorer_out",
+    MODEL_TENSOR.POINT_QUERY_NORM:                "point.query_norm",
+    MODEL_TENSOR.POINT_QUERY:                     "point.query",
+    MODEL_TENSOR.POINT_KEY_NORM:                  "point.key_norm",
+    MODEL_TENSOR.POINT_KEY:                       "point.key",
+    MODEL_TENSOR.POINT_PAIR_NORM:                 "point.pair_norm",
+    MODEL_TENSOR.POINT_SUB_QUERY:                 "point.sub_query",
+    MODEL_TENSOR.POINT_SIZE_UP:                   "point.size_up",
+    MODEL_TENSOR.POINT_SIZE_DOWN:                 "point.size_down",
+    MODEL_TENSOR.POINT_LOC_UP:                    "point.loc_up",
+    MODEL_TENSOR.POINT_LOC_DOWN:                  "point.loc_down",
     MODEL_TENSOR.CONV1D:                    "conv1d",
     MODEL_TENSOR.CONVNEXT_DW:               "convnext.{bid}.dw",
     MODEL_TENSOR.CONVNEXT_NORM:             "convnext.{bid}.norm",
@@ -4864,6 +4886,70 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.DECISION_SCORER,
         MODEL_TENSOR.DECISION_SCORER_OUT,
     ],
+    MODEL_ARCH.TILDE_OMNI: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_POST_NORM,
+        MODEL_TENSOR.ATTN_GATE,
+        MODEL_TENSOR.ATTN_QKV,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.SSM_A,
+        MODEL_TENSOR.SSM_CONV1D,
+        MODEL_TENSOR.SSM_DT,
+        MODEL_TENSOR.SSM_NORM,
+        MODEL_TENSOR.SSM_BETA,
+        MODEL_TENSOR.SSM_ALPHA,
+        MODEL_TENSOR.SSM_OUT,
+        # decision head
+        MODEL_TENSOR.TOKEN_TYPES,
+        MODEL_TENSOR.DEC_ATTN_NORM,
+        MODEL_TENSOR.DEC_ATTN_Q,
+        MODEL_TENSOR.DEC_ATTN_K,
+        MODEL_TENSOR.DEC_ATTN_V,
+        MODEL_TENSOR.DEC_ATTN_OUT,
+        MODEL_TENSOR.DEC_CROSS_ATTN_NORM,
+        MODEL_TENSOR.DEC_CROSS_ATTN_NORM_KV,
+        MODEL_TENSOR.DEC_CROSS_ATTN_Q,
+        MODEL_TENSOR.DEC_CROSS_ATTN_K,
+        MODEL_TENSOR.DEC_CROSS_ATTN_V,
+        MODEL_TENSOR.DEC_CROSS_ATTN_OUT,
+        MODEL_TENSOR.DEC_FFN_NORM,
+        MODEL_TENSOR.DEC_FFN_DOWN,
+        MODEL_TENSOR.DEC_FFN_UP,
+        MODEL_TENSOR.DECISION_HIDDEN_NORM,
+        MODEL_TENSOR.DECISION_PROJ_MEMORY,
+        MODEL_TENSOR.DECISION_PROJ_QUESTION,
+        MODEL_TENSOR.DECISION_PROJ_OPTION_QUESTION,
+        MODEL_TENSOR.DECISION_PROJ_GLOBAL,
+        MODEL_TENSOR.DECISION_PROJ_OPTION_CONTEXT,
+        MODEL_TENSOR.DECISION_PROJ_OPTION_LEXICAL,
+        MODEL_TENSOR.DECISION_OPTION_SUMMARY_NORM,
+        MODEL_TENSOR.DECISION_FIELD_NORM,
+        MODEL_TENSOR.DECISION_OPTION_NORM,
+        MODEL_TENSOR.DECISION_SCALES,
+        MODEL_TENSOR.DECISION_SCORER,
+        MODEL_TENSOR.DECISION_SCORER_OUT,
+        MODEL_TENSOR.POINT_QUERY_NORM,
+        MODEL_TENSOR.POINT_QUERY,
+        MODEL_TENSOR.POINT_KEY_NORM,
+        MODEL_TENSOR.POINT_KEY,
+        MODEL_TENSOR.POINT_PAIR_NORM,
+        MODEL_TENSOR.POINT_SUB_QUERY,
+        MODEL_TENSOR.POINT_SIZE_UP,
+        MODEL_TENSOR.POINT_SIZE_DOWN,
+        MODEL_TENSOR.POINT_LOC_UP,
+        MODEL_TENSOR.POINT_LOC_DOWN,
+    ],
     MODEL_ARCH.DOTS1: [
         MODEL_TENSOR.TOKEN_EMBD,
         MODEL_TENSOR.OUTPUT_NORM,
@@ -6142,7 +6228,7 @@ class DecisionType:
     KEV     = "kev"      # dot product of the hidden states of the last token and of one end token per option
     NIMBLE  = "nimble"   # same as openjev, the prompt lists all the questions of the request
     CLEF    = "clef"     # joint head over all questions, one score per option
-    TILDE   = "tilde"    # Tilde: Clef joint head on a Ling-3.0 backbone with bidirectional MLA
+    TILDE   = "tilde"    # Tilde: Clef joint head on a Ling-3.0 backbone with bidirectional MLA (also tilde_omni: Qwen3.5 backbone)
     PPLX_DECIDER = "pplx-decider"  # same as openjev, label codes of 1 or 2 letters
     LFM2_D1 = "lfm2-d1"  # same as openjev, the labels depend on the question type
 

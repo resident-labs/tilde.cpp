@@ -270,6 +270,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_bailingmoe3(params);
         case LLM_ARCH_TILDE:
             return new llama_model_tilde(params);
+        case LLM_ARCH_TILDE_OMNI:
+            return new llama_model_tilde_omni(params);
         case LLM_ARCH_SEED_OSS:
             return new llama_model_seed_oss(params);
         case LLM_ARCH_DOTS1:
@@ -2390,6 +2392,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_RND1:
         case LLM_ARCH_CLEF:
         case LLM_ARCH_TILDE:
+        case LLM_ARCH_TILDE_OMNI:
             {
                 res = nullptr;
             } break;
@@ -3128,6 +3131,9 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
             return model->hparams.use_mrope() ? LLAMA_ROPE_TYPE_MROPE : LLAMA_ROPE_TYPE_NORM;
         case LLM_ARCH_TILDE:
             return LLAMA_ROPE_TYPE_NORM;
+        // the Qwen3.5 interleaved M-RoPE with the same position in every section is NEOX rope (1D positions)
+        case LLM_ARCH_TILDE_OMNI:
+            return LLAMA_ROPE_TYPE_NEOX;
         // HY_V4 rotates consecutive pairs, matching the reference implementation
         case LLM_ARCH_HY_V4:
             return LLAMA_ROPE_TYPE_NORM;

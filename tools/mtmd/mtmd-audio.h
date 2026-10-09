@@ -105,12 +105,16 @@ struct mtmd_audio_preprocessor_gemma4ua : mtmd_audio_preprocessor {
 };
 
 struct mtmd_audio_preprocessor_qwen3a : mtmd_audio_preprocessor {
-    mtmd_audio_preprocessor_qwen3a(const clip_ctx * ctx) : mtmd_audio_preprocessor(ctx) {}
+    mtmd_audio_preprocessor_qwen3a(const clip_ctx * ctx, bool whisper_frames = false)
+        : mtmd_audio_preprocessor(ctx), whisper_frames(whisper_frames) {}
     void initialize() override;
     bool preprocess(const float * samples, size_t n_samples, std::vector<mtmd_audio_mel> & output) const override;
 
   private:
     mtmd_audio_cache cache;
+    // tilde omni: exactly WhisperFeatureExtractor's frames (n_samples / hop: the last STFT frame is dropped, and the
+    // log-mel maximum is taken over the kept frames), as tilda.qwen35.model.online.mel_of computes them
+    bool whisper_frames = false;
 };
 
 struct mtmd_audio_preprocessor_dots3note : mtmd_audio_preprocessor {

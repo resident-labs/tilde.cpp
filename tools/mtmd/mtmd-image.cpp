@@ -1876,3 +1876,106 @@ mtmd_image_preproc_out mtmd_image_preprocessor_muse_glimmer::preprocess(const cl
     output.append(hparams, resized_image, true);
     return output;
 }
+
+//
+// tilde omni
+//
+
+// ref: tilda/vision/merge.py. A cell (32 x 32 px) is flat when every pixel of every channel lies within 3 of the cell's
+// mean; flat cells that touch (4-connectivity) and whose means lie within 3 of the region's first cell (in row-major
+// order) form one token; every other cell is its own token. Tokens are numbered by their first cell.
+int32_t tilde_merge_cells(const unsigned char * rgb, int nx, int ny, int32_t * token_of_cell) {
+    constexpr int    px  = 32;
+    constexpr double tol = 3.0;
+    if (nx <= 0 || ny <= 0 || nx % px || ny % px) {
+        return -1;
+    }
+    const int rows = ny / px, cols = nx / px, n = rows * cols;
+    std::vector<double> mean((size_t) n * 3);
+    std::vector<char>   flat(n);
+    for (int r = 0; r < rows; r++) {
+        for (int c = 0; c < cols; c++) {
+            double sum[3] = { 0, 0, 0 };
+            for (int y = 0; y < px; y++) {
+                const unsigned char * p = rgb + ((size_t) (r * px + y) * nx + c * px) * 3;
+                for (int x = 0; x < px * 3; x++) {
+                    sum[x % 3] += p[x];
+                }
+            }
+            double * m = &mean[(size_t) (r * cols + c) * 3];
+            for (int k = 0; k < 3; k++) {
+                m[k] = sum[k] / (px * px);
+            }
+            double spread = 0.0;
+            for (int y = 0; y < px; y++) {
+                const unsigned char * p = rgb + ((size_t) (r * px + y) * nx + c * px) * 3;
+                for (int x = 0; x < px * 3; x++) {
+                    spread = std::max(spread, std::fabs(p[x] - m[x % 3]));
+                }
+            }
+            flat[r * cols + c] = spread <= tol;
+        }
+    }
+    std::vector<int> region(n, -1);
+    std::vector<int> queue;
+    for (int i = 0; i < n; i++) {
+        if (region[i] >= 0 || !flat[i]) {
+            continue;
+        }
+        const double * seed = &mean[(size_t) i * 3];
+        region[i] = i;
+        queue.assign(1, i);
+        for (size_t q = 0; q < queue.size(); q++) {
+            const int y = queue[q] / cols, x = queue[q] % cols;
+            const int ny4[4] = { y - 1, y + 1, y, y };
+            const int nx4[4] = { x, x, x - 1, x + 1 };
+            for (int k = 0; k < 4; k++) {
+                if (ny4[k] < 0 || ny4[k] >= rows || nx4[k] < 0 || nx4[k] >= cols) {
+                    continue;
+                }
+                const int j = ny4[k] * cols + nx4[k];
+                if (region[j] >= 0 || !flat[j]) {
+                    continue;
+                }
+                const double * m = &mean[(size_t) j * 3];
+                double d = 0.0;
+                for (int ch = 0; ch < 3; ch++) {
+                    d = std::max(d, std::fabs(m[ch] - seed[ch]));
+                }
+                if (d <= tol) {
+                    region[j] = i;
+                    queue.push_back(j);
+                }
+            }
+        }
+    }
+    // tokens numbered by first cell: a merged region by its label, any other cell by itself
+    std::vector<int32_t> first(n, -1);
+    int32_t n_tokens = 0;
+    for (int i = 0; i < n; i++) {
+        const int key = region[i] >= 0 ? region[i] : i;
+        if (first[key] < 0) {
+            first[key] = n_tokens++;
+        }
+        token_of_cell[i] = first[key];
+    }
+    return n_tokens;
+}
+
+mtmd_image_preproc_out mtmd_image_preprocessor_tilde_omni::preprocess(const clip_image_u8 & img) const {
+    const auto size = img.get_size();
+    const int cell = hparams.patch_size * 2;
+    GGML_ASSERT(size.width % cell == 0 && size.height % cell == 0 && "tilde omni images are stored at multiples of 32 px");
+    mtmd_image_preproc_out output;
+    output.append(hparams, img, true);
+    auto & dst = output.entries.back();
+    dst.tilde_scale = img.tilde_scale;
+    if (img.tilde_pair) {
+        // tilda.qwen35.model.online._vision_layout_job: a frame pair keeps every cell (motion may sit in a flat cell)
+        dst.tilde_tokens = (size.width / cell) * (size.height / cell);
+    } else if (!img.is_placeholder()) {
+        dst.tilde_token_of_cell.resize((size_t) (size.width / cell) * (size.height / cell));
+        dst.tilde_tokens = tilde_merge_cells(img.get_ro_buf().data(), size.width, size.height, dst.tilde_token_of_cell.data());
+    }
+    return output;
+}

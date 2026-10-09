@@ -1097,6 +1097,14 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
             {
                 builder = std::make_unique<clip_graph_qwen3a>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_TILDE_OMNI_V:
+            {
+                builder = std::make_unique<clip_graph_tilde_omni_v>(ctx, img);
+            } break;
+        case PROJECTOR_TYPE_TILDE_OMNI_A:
+            {
+                builder = std::make_unique<clip_graph_tilde_omni_a>(ctx, img);
+            } break;
         case PROJECTOR_TYPE_MIMO_AUDIO:
             {
                 builder = std::make_unique<clip_graph_mimo_audio>(ctx, img);
@@ -1690,6 +1698,7 @@ struct clip_model_loader {
                 case PROJECTOR_TYPE_QWEN25VL:
                 case PROJECTOR_TYPE_QWEN3VL:
                 case PROJECTOR_TYPE_LING3VL:
+                case PROJECTOR_TYPE_TILDE_OMNI_V:
                     {
                         hparams.n_merge = 2; // default value for Qwen 2 and 2.5
                         hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
@@ -1823,6 +1832,7 @@ struct clip_model_loader {
                 case PROJECTOR_TYPE_ULTRAVOX:
                 case PROJECTOR_TYPE_QWEN2A:
                 case PROJECTOR_TYPE_QWEN3A:
+                case PROJECTOR_TYPE_TILDE_OMNI_A:
                 case PROJECTOR_TYPE_GLMA:
                 case PROJECTOR_TYPE_VOXTRAL:
                 case PROJECTOR_TYPE_MERALION:
@@ -2537,6 +2547,24 @@ struct clip_model_loader {
                     model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
                     model.mm_1_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"));
                 } break;
+            case PROJECTOR_TYPE_TILDE_OMNI_V:
+                {
+                    model.mm_0_w = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"));
+                    model.mm_0_b = get_tensor(string_format(TN_LLAVA_PROJ, 0, "bias"));
+                    model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
+                    model.mm_1_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"));
+                    model.tilde_lin_w  = get_tensor(string_format(TN_TILDE_V, "lin",  "weight"));
+                    model.tilde_lin_b  = get_tensor(string_format(TN_TILDE_V, "lin",  "bias"));
+                    model.tilde_mlp0_w = get_tensor(string_format(TN_TILDE_V, "mlp0", "weight"));
+                    model.tilde_mlp0_b = get_tensor(string_format(TN_TILDE_V, "mlp0", "bias"));
+                    model.tilde_mlp2_w = get_tensor(string_format(TN_TILDE_V, "mlp2", "weight"));
+                    model.tilde_mlp2_b = get_tensor(string_format(TN_TILDE_V, "mlp2", "bias"));
+                    model.tilde_pos_w  = get_tensor(string_format(TN_TILDE_V, "pos",  "weight"));
+                    model.tilde_pos_b  = get_tensor(string_format(TN_TILDE_V, "pos",  "bias"));
+                    model.tilde_sub_key_norm_w = get_tensor(string_format(TN_TILDE_V, "sub_key_norm", "weight"));
+                    model.tilde_sub_key_norm_b = get_tensor(string_format(TN_TILDE_V, "sub_key_norm", "bias"));
+                    model.tilde_sub_key_w      = get_tensor(string_format(TN_TILDE_V, "sub_key",      "weight"));
+                } break;
             case PROJECTOR_TYPE_LING3VL:
                 {
                     model.mm_input_norm_w = get_tensor(TN_MM_INP_NORM);        // merger.norm
@@ -2925,7 +2953,12 @@ struct clip_model_loader {
                     model.mm_fc_b = get_tensor(string_format(TN_MM_AUDIO_FC, "bias"));
                 } break;
             case PROJECTOR_TYPE_QWEN3A:
+            case PROJECTOR_TYPE_TILDE_OMNI_A:
                 {
+                    if (model.proj_type == PROJECTOR_TYPE_TILDE_OMNI_A) {
+                        model.tilde_lin_w = get_tensor(string_format(TN_TILDE_A, "lin", "weight"));
+                        model.tilde_lin_b = get_tensor(string_format(TN_TILDE_A, "lin", "bias"));
+                    }
                     model.conv2d_1_w = get_tensor(string_format(TN_CONV2D, 1, "weight"));
                     model.conv2d_1_b = get_tensor(string_format(TN_CONV2D, 1, "bias"));
                     model.conv2d_2_w = get_tensor(string_format(TN_CONV2D, 2, "weight"));
@@ -4343,6 +4376,16 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
                     n_patches /= 2;
                 }
             } break;
+        case PROJECTOR_TYPE_TILDE_OMNI_V:
+            {
+                // image tokens after blank merging (one per 32 px cell without it)
+                n_patches = img->tilde_tokens > 0 ? img->tilde_tokens : n_patches / 4;
+            } break;
+        case PROJECTOR_TYPE_TILDE_OMNI_A:
+            {
+                // the valid frames only: a partial last chunk gives fewer tokens (padding is dropped, as the reference)
+                n_patches = img->tilde_tokens > 0 ? img->tilde_tokens : (img->nx() / 100) * 13;
+            } break;
         case PROJECTOR_TYPE_QWEN3A:
             {
                 // chunk_size=100 frames --> 3x stride-2 conv2d --> 13 tokens per chunk
@@ -4507,6 +4550,81 @@ static std::vector<c2w_state_slot> list_gen_state_slots(const clip_hparams & hpa
         case PROJECTOR_TYPE_POCKETTTS_GEN: return list_pockettts_state_slots(hparams, model);
         default:                           return {};
     }
+}
+
+// tilde omni vision inputs from the blank-merging map of the cells (ref: tilda/vision/model.py token_layout,
+// position_features): the cell -> token averaging matrix, each token's position features (centre x, y and extent as
+// image fractions at 16 frequencies, then log2 of the stored image's scale), its representative cell and whether it
+// is a single cell
+template <typename F32, typename I32>
+static void clip_tilde_omni_set_inputs(const clip_image_f32 & img, int patch_size, F32 && set_f32, I32 && set_i32) {
+    const int cols = img.nx() / (patch_size * 2);
+    const int rows = img.ny() / (patch_size * 2);
+    const int n_cells = rows * cols;
+    std::vector<int32_t> token_of_cell = img.tilde_token_of_cell;
+    if (token_of_cell.empty()) {
+        token_of_cell.resize(n_cells);
+        for (int i = 0; i < n_cells; i++) {
+            token_of_cell[i] = i;
+        }
+    }
+    GGML_ASSERT((int) token_of_cell.size() == n_cells);
+    int n_tokens = 0;
+    for (int32_t t : token_of_cell) {
+        n_tokens = std::max(n_tokens, t + 1);
+    }
+    std::vector<std::vector<int>> members(n_tokens);
+    for (int c = 0; c < n_cells; c++) {
+        members[token_of_cell[c]].push_back(c);
+    }
+    constexpr int n_freq = 16;
+    std::vector<float>   merge((size_t) n_cells * n_tokens, 0.0f);
+    std::vector<float>   pos((size_t) (8 * n_freq + 1) * n_tokens, 0.0f);
+    std::vector<int32_t> rep(n_tokens);
+    std::vector<float>   single(n_tokens);
+    const float log2_scale = (float) std::log2((double) img.tilde_scale);
+    for (int t = 0; t < n_tokens; t++) {
+        const auto & cells = members[t];
+        GGML_ASSERT(!cells.empty());
+        double sy = 0.0, sx = 0.0;
+        int x0 = cols, x1 = -1, y0 = rows, y1 = -1;
+        for (int c : cells) {
+            const int y = c / cols, x = c % cols;
+            sy += y; sx += x;
+            x0 = std::min(x0, x); x1 = std::max(x1, x);
+            y0 = std::min(y0, y); y1 = std::max(y1, y);
+            merge[(size_t) t * n_cells + c] = 1.0f / cells.size();
+        }
+        const double cy = (sy / cells.size() + 0.5) / rows;
+        const double cx = (sx / cells.size() + 0.5) / cols;
+        int best = cells[0];
+        double best_d = INFINITY;
+        for (int c : cells) {
+            const double dy = ((c / cols) + 0.5) / rows - cy;
+            const double dx = ((c % cols) + 0.5) / cols - cx;
+            const double d = dy * dy + dx * dx;
+            if (d < best_d) {
+                best_d = d;
+                best = c;
+            }
+        }
+        rep[t] = best;
+        single[t] = cells.size() == 1 ? 1.0f : 0.0f;
+        const float geo[4] = { (float) cx, (float) cy, (float) ((x1 - x0 + 1) / (double) cols), (float) ((y1 - y0 + 1) / (double) rows) };
+        float * p = pos.data() + (size_t) t * (8 * n_freq + 1);
+        for (int g = 0; g < 4; g++) {
+            for (int k = 0; k < n_freq; k++) {
+                const float a = geo[g] * std::ldexp((float) M_PI, k);
+                p[g * n_freq + k]              = std::sin(a);
+                p[4 * n_freq + g * n_freq + k] = std::cos(a);
+            }
+        }
+        p[8 * n_freq] = log2_scale;
+    }
+    set_f32("tilde_merge", merge);
+    set_f32("tilde_pos", pos);
+    set_i32("tilde_rep", rep);
+    set_f32("tilde_single", single);
 }
 
 bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
@@ -4883,7 +5001,11 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         case PROJECTOR_TYPE_LING3VL:
         case PROJECTOR_TYPE_GLM4V:
         case PROJECTOR_TYPE_GLM5V:
+        case PROJECTOR_TYPE_TILDE_OMNI_V:
             {
+                if (ctx->proj_type() == PROJECTOR_TYPE_TILDE_OMNI_V) {
+                    clip_tilde_omni_set_inputs(imgs.entries[0], patch_size, set_input_f32, set_input_i32);
+                }
                 const int merge_ratio = hparams.n_merge;
                 const int pw = image_size_width  / patch_size;
                 const int ph = image_size_height / patch_size;
@@ -5355,6 +5477,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         case PROJECTOR_TYPE_NEMOTRON_V2_VL:
         case PROJECTOR_TYPE_QWEN2A:
         case PROJECTOR_TYPE_QWEN3A:
+        case PROJECTOR_TYPE_TILDE_OMNI_A:
         case PROJECTOR_TYPE_GLMA:
         case PROJECTOR_TYPE_ULTRAVOX:
         case PROJECTOR_TYPE_LFM2:
@@ -6078,6 +6201,10 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
             return ctx->model.mm_fc_w->ne[1];
         case PROJECTOR_TYPE_QWEN3A:
             return ctx->model.mm_2_w->ne[1];
+        case PROJECTOR_TYPE_TILDE_OMNI_V:
+        case PROJECTOR_TYPE_TILDE_OMNI_A:
+            // the LM input embedding + the point head's side values (see models/tilde-omni.cpp)
+            return ctx->model.tilde_lin_w->ne[1] + 512;
         case PROJECTOR_TYPE_GLMA:
         case PROJECTOR_TYPE_LFM2:
         case PROJECTOR_TYPE_KIMIVL:
@@ -6145,6 +6272,7 @@ int clip_model_n_temporal_merge(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_QWEN25VL:
         case PROJECTOR_TYPE_QWEN3VL:
         case PROJECTOR_TYPE_LING3VL:
+        case PROJECTOR_TYPE_TILDE_OMNI_V:
             return 2;
         default:
             return 1;

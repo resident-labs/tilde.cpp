@@ -27,7 +27,7 @@
 #include <vector>
 
 // remember to bump this if the serialization format changes
-#define MTMD_SERIALIZATION_VERSION 2
+#define MTMD_SERIALIZATION_VERSION 3
 
 struct mtmd_serialization {
     // note: using 64-bit here for future-proofing
@@ -108,6 +108,7 @@ void clip_image_f32::serialize(mtmd_serialization & ser) const {
     ser.write(lead_pad);
     ser.write((int32_t)nx_);
     ser.write((int32_t)ny_);
+    ser.write(tilde_tokens);
 }
 void clip_image_f32::deserialize(mtmd_serialization & ser) {
     add_viewsep = ser.read<bool>();
@@ -115,6 +116,7 @@ void clip_image_f32::deserialize(mtmd_serialization & ser) {
     lead_pad = ser.read<int32_t>();
     nx_ = ser.read<int32_t>();
     ny_ = ser.read<int32_t>();
+    tilde_tokens = ser.read<int32_t>();
     buf.clear(); // always a placeholder after loading
 }
 
@@ -129,7 +131,7 @@ void clip_image_f32_batch::serialize(mtmd_serialization & ser) const {
 void clip_image_f32_batch::deserialize(mtmd_serialization & ser) {
     is_audio = ser.read<bool>();
     uint64_t n = ser.read<uint64_t>();
-    constexpr size_t min_entry_bytes = sizeof(uint8_t) * 2 + sizeof(int32_t) * 2;
+    constexpr size_t min_entry_bytes = sizeof(uint8_t) * 2 + sizeof(int32_t) * 4;
     if (n > (ser.data.size() - ser.read_pos) / min_entry_bytes) {
         throw std::runtime_error("entries count exceeds buffer size");
     }
@@ -150,6 +152,7 @@ void clip_image_f32_batch::deserialize(mtmd_serialization & ser) {
 struct mtmd_bitmap {
     uint32_t nx = 0;
     uint32_t ny = 0;
+    float tilde_scale = 1.0f; // tilde omni: stored pixels per original pixel
     std::string id; // optional user-defined id, for ex: can be set to image hash, useful for KV cache tracking
     bool is_audio = false; // true if the bitmap is audio
     bool mergeable = false; // [QWEN_VIDEO] set only on frames of the same video
@@ -702,6 +705,11 @@ struct mtmd_context {
                     img_end = "<|vision_end|>";
                     image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
                 } break;
+            case PROJECTOR_TYPE_TILDE_OMNI_V:
+                {
+                    // the caller places the image start / end markers (tilde.vision_token_ids)
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_tilde_omni>(ctx_v);
+                } break;
             case PROJECTOR_TYPE_MINIMAX_M3:
                 {
                     // ]<]start of image[>[ ... (image embeddings) ... ]<]end of image[>[
@@ -959,6 +967,11 @@ struct mtmd_context {
                     aud_beg = "<|audio_start|>";
                     aud_end = "<|audio_end|>";
                     audio_preproc = std::make_unique<mtmd_audio_preprocessor_qwen3a>(ctx_a);
+                } break;
+            case PROJECTOR_TYPE_TILDE_OMNI_A:
+                {
+                    // the caller places the block markers (tilde.audio_marker_ids)
+                    audio_preproc = std::make_unique<mtmd_audio_preprocessor_qwen3a>(ctx_a, /* whisper_frames */ true);
                 } break;
             case PROJECTOR_TYPE_VOXTRAL:
                 {
@@ -1391,6 +1404,8 @@ struct mtmd_tokenizer {
                     {(int)bmp->nx, (int)bmp->ny},
                     bmp->is_placeholder());
                 img_u8.cpy_buf(bmp->get_ro_buf());
+                img_u8.tilde_scale = bmp->tilde_scale;
+                img_u8.tilde_pair  = bitmaps.size() == 2;
 
                 // preprocess image
                 mtmd_image_preproc_out tmp_preproc_out = ctx->image_preproc->preprocess(img_u8);
@@ -1633,6 +1648,7 @@ struct mtmd_tokenizer {
                     {(int)mel_spec.n_len, (int)mel_spec.n_mel},
                     is_placeholder, /* is_audio */ true);
                 mel_f32.cpy_buf(mel_spec.data);
+                mel_f32.tilde_tokens = clip_tilde_audio_tokens((int) mel_spec.n_len_org);
 
                 size_t n_tokens = clip_n_output_tokens(ctx->ctx_a, &mel_f32);
 
@@ -2289,6 +2305,14 @@ void mtmd_bitmap_set_id(mtmd_bitmap * bitmap, const char * id) {
     } else {
         bitmap->id.clear();
     }
+}
+
+void mtmd_bitmap_set_tilde_scale(mtmd_bitmap * bitmap, float scale) {
+    bitmap->tilde_scale = scale;
+}
+
+int32_t mtmd_tilde_merge_cells(const unsigned char * rgb, uint32_t nx, uint32_t ny, int32_t * token_of_cell) {
+    return tilde_merge_cells(rgb, (int) nx, (int) ny, token_of_cell);
 }
 
 void mtmd_bitmap_set_mergeable(mtmd_bitmap * bitmap, bool mergeable) {

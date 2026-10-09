@@ -183,3 +183,62 @@ has 12,383 nodes at 65,536 tokens).
 - Metal and ROCm are untested (no hardware); Vulkan passes parity (older build).
 - `schedule/free_11` in the conformance set is missed by I8CX and Q8_0 (p 0.91, want false); not yet checked against
   PyTorch.
+
+# Tilde Omni (tilde-4b-omni)
+
+Last updated 2026-10-08 21:35 CDT. Model: TLive-Omni-4B (TaoLiveAIGC/TLive-Omni-4B @ cfbac342, Qwen3.5-4B text decoder
++ Qwen3.5 ViT + AuT audio tower) trained from base with the Tilde joint head and the unified point head
+(`omni_full_tlive4b_20261007/final_folded`). Measured on hermeslab (RTX 3090 Ti, i7-12700K) unless marked.
+
+## Phase
+
+1. Text path: **done** (arch `tilde_omni`, converter, CPU + CUDA parity, request-encoder parity; independent review
+   clean after 10 findings fixed: lexical-table and none-vector checks in the converter, a compact media input path
+   instead of 3072-wide inputs for every token, output-capacity rejection, smaller no-FA limit, gguf-py names).
+2. Vision + pointing: code written (mmproj converter, `tilde_omni_v` clip graph, point head in the LM graph,
+   `/v1/systemone` images + `point` questions, tilde-eval `--mmproj`); parity not run yet.
+3. Audio: code written (`tilde_omni_a`: AuT + native bridge, Whisper-exact frames, valid-token windows); parity not run.
+4. Speed: not started.
+5. Service: not started.
+
+## Temperature
+
+The HF `final_folded` holds the quick-fit T = 1.28 (its report's `temperature_fold`; checked against `final`'s head:
+the logit scales differ by exactly log 1.28). The full-DEV fit is T = 1.40 (FINAL_EVALS.json). The GGUF serves at
+T = 1.40: the converter folds the remaining factor 1.40 / 1.28 = 1.09375 into the head (`tilde.temperature_folded`
+1.40, `tilde.checkpoint_temperature` 1.28). The point head is not temperature-scaled (as trained).
+
+## Files
+
+`tilde/convert_tilde_omni_to_gguf.py` (LM: text decoder, joint head, point head, markers + 7 media ids;
+`tilde-4b-omni-BF16.gguf` 10.1 GB, `Q8_0` 6.8 GB via `llama-quantize --token-embedding-type bf16
+--output-tensor-type bf16 --tensor-type '^(decision\.|dec\.|token_types|point\.)=f32'`),
+`tilde/convert_tilde_omni_mmproj.py` (ViT + merger + bridge + sub-patch keys, AuT + audio bridge; F16 2.1 GB).
+
+## Parity: text (5,235 DEV records / 7,365 fields; the Ling parity set's states re-encoded with the omni tokenizer)
+
+Reference: `tilde/parity/reference_omni.py run` (tilda.qwen35 serving, profile ampere24_bf16 = exact bf16, autocast
+bf16, logits / 1.09375). Records: `reference_omni.py encode` from `frozen/tilda41_20261006/dev_orig40_clean.jsonl`,
+ids of `tilde_parity_20261008/gpu_sub.jsonl` (all 5,235 found, same field order).
+
+| run | fields | accuracy (ref -> test) | delta (pt) | log loss delta | mean abs dp | p99 abs dp | max abs dp | argmax agreement | strict gates |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---|
+| CUDA BF16 | 7,365 | 0.8831 -> 0.8826 | -0.05 | +0.0002 | 0.0010 | 0.011 | 0.062 | 99.88% | pass |
+| CUDA Q8_0 | 7,365 | 0.8831 -> 0.8823 | -0.08 | +0.0001 | 0.0022 | 0.026 | 0.147 | 99.73% | pass |
+
+CPU (i7-12700K, 8 threads, 214 records <= 2,048 tokens / 277 fields): Q8_0 0.8700 -> 0.8628 (2 fields flip), mean
+|dp| 0.0021, argmax 99.28%. CPU BF16: running.
+
+Request encoder (`tilde/parity/encoder_parity.py` with the omni GGUF and tokenizer, 3,033 bodies from the DEV states +
+edge cases): 3,016 / 3,016 accepted bodies token- and order-exact against `tilda.joint_serving.encode_request`, 17 both
+rejected (15 with the same message).
+
+Total model time over the 5,235 records (batch 1, one request per call, 2.63M tokens): PyTorch bf16 433.5 s,
+CUDA BF16 481.1 s, CUDA Q8_0 371.3 s (not yet optimized; long requests are slower than PyTorch, e.g. 27k tokens
+5.6 s BF16 vs 4.0 s PyTorch; Phase 4).
+
+GPU window for these runs: tilde-server down 20:50:01-21:12:53 CDT (1,372 s).
+
+## Open problems
+
+- Speed on long requests (Phase 4): the full-attention layers (head_dim 256, GQA 4) and the delta net.

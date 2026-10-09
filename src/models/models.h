@@ -2595,6 +2595,121 @@ struct llama_model_clef : public llama_model_qwen35 {
 };
 
 
+// Tilde Omni: a Qwen3.5 backbone (TLive-Omni-4B) whose full-attention layers attend non-causally over the whole
+// request (the Gated DeltaNet layers stay causal, from zero states), read by the Clef-style joint decision head of
+// Tilde. One forward pass, no memory; the embeddings output holds one calibrated logit per option, see tilde.cpp.
+struct llama_model_tilde_omni : public llama_model_qwen35 {
+    llama_model_tilde_omni(const struct llama_model_params & params) : llama_model_qwen35(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct attn {
+        ggml_tensor * wq = nullptr;
+        ggml_tensor * bq = nullptr;
+        ggml_tensor * wk = nullptr;
+        ggml_tensor * bk = nullptr;
+        ggml_tensor * wv = nullptr;
+        ggml_tensor * bv = nullptr;
+        ggml_tensor * wo = nullptr;
+        ggml_tensor * bo = nullptr;
+    };
+
+    struct norm {
+        ggml_tensor * w = nullptr;
+        ggml_tensor * b = nullptr;
+    };
+
+    // the first n_layer_routing blocks have no self attention
+    struct head_layer {
+        norm self_norm;
+        attn self_attn;
+        norm cross_norm;
+        norm cross_norm_kv; // routing blocks only
+        attn cross_attn;
+        norm ffn_norm;
+        ggml_tensor * ffn_up     = nullptr;
+        ggml_tensor * ffn_up_b   = nullptr;
+        ggml_tensor * ffn_down   = nullptr;
+        ggml_tensor * ffn_down_b = nullptr;
+    };
+
+    uint32_t n_layer_routing = 0;
+    uint32_t n_layer_joint   = 0;
+    uint32_t n_head_decision = 0;
+
+    std::vector<head_layer> head_layers; // routing blocks, then joint blocks
+
+    norm hidden_norm;
+    norm option_summary_norm;
+    norm field_norm;
+    norm option_norm;
+
+    ggml_tensor * proj_memory          = nullptr;
+    ggml_tensor * proj_question        = nullptr;
+    ggml_tensor * proj_option_question = nullptr;
+    ggml_tensor * proj_global          = nullptr;
+    ggml_tensor * proj_option_context  = nullptr;
+    ggml_tensor * proj_option_lexical  = nullptr;
+    ggml_tensor * scales               = nullptr; // prior scale, joint scale, residual gate (temperature folded)
+    ggml_tensor * type_embd            = nullptr;
+    ggml_tensor * scorer               = nullptr;
+    ggml_tensor * scorer_b             = nullptr;
+    ggml_tensor * scorer_out           = nullptr;
+    ggml_tensor * scorer_out_b         = nullptr;
+
+    // the point head (tilda.vision.point.PointHead, unified); its sub-patch keys come with the image embeddings
+    struct {
+        norm query_norm;
+        ggml_tensor * query       = nullptr;
+        norm key_norm;
+        ggml_tensor * key         = nullptr;
+        norm pair_norm;
+        ggml_tensor * sub_query   = nullptr;
+        ggml_tensor * size_up     = nullptr;
+        ggml_tensor * size_up_b   = nullptr;
+        ggml_tensor * size_down   = nullptr;
+        ggml_tensor * size_down_b = nullptr;
+        ggml_tensor * loc_up      = nullptr;
+        ggml_tensor * loc_up_b    = nullptr;
+        ggml_tensor * loc_down    = nullptr;
+        ggml_tensor * loc_down_b  = nullptr;
+    } point;
+
+    class input_decision;
+
+    // I8 weights (CUDA int8 GEMM preset): the scale of each output row, by weight
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> row_scales;
+
+    // the scale of an I8 weight, nullptr for any other weight
+    ggml_tensor * row_scale(const ggml_tensor * w) const {
+        auto it = w ? row_scales.find(w) : row_scales.end();
+        return it == row_scales.end() ? nullptr : it->second;
+    }
+
+    struct graph : public llm_build_delta_net_base {
+        graph(const llama_model & model, const llm_graph_params & params);
+
+    private:
+        // w x, with the row scales of I8 weights applied
+        ggml_tensor * mm(ggml_tensor * w, ggml_tensor * x);
+        ggml_tensor * build_layer_attn(ggml_tensor * cur, ggml_tensor * inp_pos, int il);
+        ggml_tensor * build_layer_gdn(ggml_tensor * cur, int il);
+        // returns the option logits [1, n_options]; fields: the final field vectors [n_embd_h, n_questions]
+        ggml_tensor * build_head(ggml_tensor * hidden, input_decision * inp, ggml_tensor ** fields);
+        // the point head outputs of every point field, one flat array (see TILDE_OMNI_POINT_EXTRA)
+        ggml_tensor * build_points(ggml_tensor * hidden, ggml_tensor * fields, ggml_tensor * side, input_decision * inp);
+        ggml_tensor * build_head_norm(ggml_tensor * cur, const norm & n);
+        ggml_tensor * build_head_attn(ggml_tensor * q, ggml_tensor * kv, const attn & a);
+        ggml_tensor * build_head_ffn(ggml_tensor * cur, const head_layer & layer);
+        ggml_tensor * build_span_means(ggml_tensor * table, ggml_tensor * ids, ggml_tensor * const * pools, size_t n_pools);
+
+        const llama_model_tilde_omni & model;
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
 struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
 

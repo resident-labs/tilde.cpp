@@ -679,11 +679,17 @@ bool mtmd_audio_preprocessor_qwen3a::preprocess(const float *                 sa
         return false;
     }
 
+    // the frames WhisperFeatureExtractor keeps (whisper_frames: it drops the last STFT frame)
+    const int64_t n_keep = whisper_frames ? std::min(mel_full.n_len, (int64_t)(n_samples / hparams.audio_hop_len)) : mel_full.n_len;
+
     // Whisper-style normalization: clamp to (max - 8), scale to [-1, 1]
     {
         double mmax = -1e20;
-        for (float v : mel_full.data) {
-            if (v > mmax) mmax = v;
+        for (int64_t m = 0; m < mel_full.n_mel; m++) {
+            for (int64_t t = 0; t < n_keep; t++) {
+                const float v = mel_full.data[(size_t) m * mel_full.n_len + t];
+                if (v > mmax) mmax = v;
+            }
         }
         mmax -= 8.0;
         for (float & v : mel_full.data) {
@@ -693,7 +699,7 @@ bool mtmd_audio_preprocessor_qwen3a::preprocess(const float *                 sa
 
     // The effective frame count: center-padded STFT gives ~n_samples/hop_length frames.
     // We take min(mel_full.n_len, n_samples/hop + 1) to avoid including excess frames.
-    const int64_t n_eff = std::min(mel_full.n_len,
+    const int64_t n_eff = whisper_frames ? n_keep : std::min(mel_full.n_len,
                                (int64_t)(n_samples / hparams.audio_hop_len) + 1);
 
     // Split into inference windows matching n_window_infer=800 from model config.

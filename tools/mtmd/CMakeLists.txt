@@ -58,6 +58,7 @@ add_library(mtmd
             models/ling3vl.cpp
             models/mimovl.cpp
             models/qwen3a.cpp
+            models/tilde-omni.cpp
             models/mimo-audio.cpp
             models/qwen3tts-spkenc.cpp
             models/qwen3tts-gen.cpp

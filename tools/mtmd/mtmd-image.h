@@ -118,6 +118,16 @@ struct mtmd_image_preprocessor_fixed_size : mtmd_image_preprocessor {
 // resize image to multiple of patch_size*n_merge, while preserving aspect ratio
 // if image_resize_pad is true, the resized image will be padded, otherwise it will be either stretched or center-cropped depending on image_resize_pad
 // this is used by models with native support for dynamic image size, for example: Qwen-VL, Pixtral, Kimi-VL, etc
+// tilde omni: the image is stored at its final size (sides multiples of 32 px, resized and padded by the caller); no
+// resize here, only the blank-merging map of its cells (tilda.vision.merge) and the Qwen normalization
+struct mtmd_image_preprocessor_tilde_omni : mtmd_image_preprocessor {
+    mtmd_image_preprocessor_tilde_omni(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
+};
+
+// tilda.vision.merge.merge_cells on an RGB image (sides multiples of 32); returns the number of tokens, -1 on bad size
+int32_t tilde_merge_cells(const unsigned char * rgb, int nx, int ny, int32_t * token_of_cell);
+
 struct mtmd_image_preprocessor_dyn_size : mtmd_image_preprocessor {
     mtmd_image_preprocessor_dyn_size(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;

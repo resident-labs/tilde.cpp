@@ -195,6 +195,8 @@
 #define TN_CONV2D       "a.conv2d.%d.%s"
 #define TN_CONV_OUT     "a.conv_out.%s"
 #define TN_MM_AUDIO_MLP "mm.a.mlp.%d.%s"
+#define TN_TILDE_V      "tilde.v.%s.%s" // tilde omni vision bridge: lin, mlp0, mlp2, pos, sub_key_norm, sub_key
+#define TN_TILDE_A      "tilde.a.%s.%s" // tilde omni audio bridge: lin
 #define TN_MM_AUDIO_FC  "mm.a.fc.%s" // fully connected layer
 #define TN_MM_NORM_PRE  "mm.a.norm_pre.%s"
 #define TN_MM_NORM_MID  "mm.a.norm_mid.%s"
@@ -470,6 +472,8 @@ enum projector_type {
     PROJECTOR_TYPE_LLAMA4,
     PROJECTOR_TYPE_QWEN2A,
     PROJECTOR_TYPE_QWEN3A,
+    PROJECTOR_TYPE_TILDE_OMNI_V,
+    PROJECTOR_TYPE_TILDE_OMNI_A,
     PROJECTOR_TYPE_GLMA,
     PROJECTOR_TYPE_QWEN25O, // will be replaced by QWEN2A or QWEN25VL depending on clip_ctx
     PROJECTOR_TYPE_VOXTRAL,
@@ -538,6 +542,8 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_LLAMA4,            "llama4"},
     { PROJECTOR_TYPE_QWEN2A,            "qwen2a"},
     { PROJECTOR_TYPE_QWEN3A,            "qwen3a"},
+    { PROJECTOR_TYPE_TILDE_OMNI_V,      "tilde_omni_v"},
+    { PROJECTOR_TYPE_TILDE_OMNI_A,      "tilde_omni_a"},
     { PROJECTOR_TYPE_GLMA,              "glma"},
     { PROJECTOR_TYPE_QWEN25O,           "qwen2.5o"},
     { PROJECTOR_TYPE_VOXTRAL,           "voxtral"},
@@ -590,6 +596,11 @@ static projector_type clip_projector_type_from_string(const std::string & str) {
 
 // RGB uint8 image
 struct clip_image_u8 {
+    // tilde omni: stored image pixels per original pixel (the bridge's position features read log2 of it), and whether
+    // the image is one frame of a pair (2 fps video: one temporal patch, every cell kept, no blank merging)
+    float tilde_scale = 1.0f;
+    bool  tilde_pair  = false;
+
     clip_image_size get_size() const {
         return { nx, ny };
     }
@@ -687,6 +698,13 @@ struct clip_image_f32 {
     };
     anyres_info anyres;
 
+    // tilde omni vision: the image token of each TOKEN_PX cell after blank merging (row-major cells), the number of
+    // tokens, and the stored image's scale (see clip_image_u8)
+    // (audio: the tokens the mel window's valid frames give, see clip_tilde_audio_tokens)
+    std::vector<int32_t> tilde_token_of_cell;
+    int32_t tilde_tokens = 0;
+    float   tilde_scale  = 1.0f;
+
     clip_image_size get_size() const {
         return { nx_, ny_ };
     }
@@ -767,6 +785,15 @@ struct clip_image_f32 {
         return (size_t) nx_ * (size_t) ny_;
     }
 };
+
+// tilde omni audio (TLive AuT, Qwen3-Omni shape): tokens of n mel frames, 13 per 100-frame chunk and the downsampled
+// length of the last partial chunk (transformers _get_feat_extract_output_lengths, n_window 50)
+static inline int clip_tilde_audio_tokens(int n_frames) {
+    const int leave = n_frames % 100;
+    const int feat  = (leave - 1) / 2 + 1;
+    const int out   = leave > 0 ? ((feat - 1) / 2 + 1 - 1) / 2 + 1 : 0;
+    return out + (n_frames / 100) * 13;
+}
 
 // token area kept after removing the padding added by the anyres resize
 // ref: https://github.com/huggingface/transformers/blob/v5.0.0/src/transformers/models/llava_next/modeling_llava_next.py#L109

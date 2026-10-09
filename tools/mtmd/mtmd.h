@@ -184,6 +184,14 @@ MTMD_API void                  mtmd_bitmap_free       (mtmd_bitmap * bitmap);
 // these getters/setters are dedicated functions, so you can for example calculate the hash of the image based on mtmd_bitmap_get_data()
 MTMD_API const char * mtmd_bitmap_get_id(const mtmd_bitmap * bitmap);
 MTMD_API void         mtmd_bitmap_set_id(mtmd_bitmap * bitmap, const char * id);
+
+// tilde omni: stored image pixels per original pixel (default 1), read by the vision bridge
+MTMD_API void         mtmd_bitmap_set_tilde_scale(mtmd_bitmap * bitmap, float scale);
+
+// tilde omni blank merging (tilda.vision.merge.merge_cells): the image token of each 32 px cell of an RGB image whose
+// sides are multiples of 32, row-major (token_of_cell must hold (nx / 32) * (ny / 32) entries); returns the number of
+// tokens, or -1 if the size is not a multiple of 32
+MTMD_API int32_t      mtmd_tilde_merge_cells(const unsigned char * rgb, uint32_t nx, uint32_t ny, int32_t * token_of_cell);
 // if true, this bitmap can be merged (temporal merge) with an adjacent mergeable bitmap by certain video input models
 MTMD_API void         mtmd_bitmap_set_mergeable(mtmd_bitmap * bitmap, bool mergeable);
 

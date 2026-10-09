@@ -2163,7 +2163,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     // joint decision heads output one score per option through the embeddings, never vocabulary logits
     // (a 64k-token batch would otherwise reserve n_vocab floats for every token)
-    if (model.arch == LLM_ARCH_CLEF || model.arch == LLM_ARCH_TILDE) {
+    if (model.arch == LLM_ARCH_CLEF || model.arch == LLM_ARCH_TILDE || model.arch == LLM_ARCH_TILDE_OMNI) {
         has_logits = false;
     }
 
@@ -2428,7 +2428,7 @@ void llama_context::output_reorder() {
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     uint32_t res;
-    if (model.arch == LLM_ARCH_TILDE) {
+    if (model.arch == LLM_ARCH_TILDE || model.arch == LLM_ARCH_TILDE_OMNI) {
         // the Tilde graph grows with the MoE token chunks (~1,100 nodes per 8,192-token chunk; 12,383 nodes at 65,536
         // tokens), not per token: n_tokens * 40 would size the scheduler's context for 2.6M nodes (a 50 GB host
         // allocation at 64k), which fails where memory is not overcommitted. n_tokens + 16,384 covers chunks down to

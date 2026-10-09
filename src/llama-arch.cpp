@@ -114,6 +114,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_BAILINGMOE2,      "bailingmoe2"      },
     { LLM_ARCH_BAILINGMOE3,      "bailingmoe3"      },
     { LLM_ARCH_TILDE,            "tilde"            },
+    { LLM_ARCH_TILDE_OMNI,       "tilde_omni"       },
     { LLM_ARCH_DOTS1,            "dots1"            },
     { LLM_ARCH_DOTS3NOTE,        "dots3note"        },
     { LLM_ARCH_ARCEE,            "arcee"            },
@@ -511,6 +512,16 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_DECISION_SCALES,                        "decision.scales" },
     { LLM_TENSOR_DECISION_SCORER,                        "decision.scorer" },
     { LLM_TENSOR_DECISION_SCORER_OUT,                    "decision.scorer_out" },
+    { LLM_TENSOR_POINT_QUERY_NORM,                           "point.query_norm" },
+    { LLM_TENSOR_POINT_QUERY,                                "point.query" },
+    { LLM_TENSOR_POINT_KEY_NORM,                             "point.key_norm" },
+    { LLM_TENSOR_POINT_KEY,                                  "point.key" },
+    { LLM_TENSOR_POINT_PAIR_NORM,                            "point.pair_norm" },
+    { LLM_TENSOR_POINT_SUB_QUERY,                            "point.sub_query" },
+    { LLM_TENSOR_POINT_SIZE_UP,                              "point.size_up" },
+    { LLM_TENSOR_POINT_SIZE_DOWN,                            "point.size_down" },
+    { LLM_TENSOR_POINT_LOC_UP,                               "point.loc_up" },
+    { LLM_TENSOR_POINT_LOC_DOWN,                             "point.loc_down" },
     { LLM_TENSOR_ENC_OUTPUT_NORM,                        "enc.output_norm" },
     { LLM_TENSOR_FFN_GATE_INP_SHEXP,                     "blk.%d.ffn_gate_inp_shexp" },
     { LLM_TENSOR_SSM_A_NOSCAN,                           "blk.%d.ssm_a" },
@@ -776,6 +787,16 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_DECISION_SCALES,            {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
     {LLM_TENSOR_DECISION_SCORER,            {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_DECISION_SCORER_OUT,        {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_POINT_QUERY_NORM,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_POINT_QUERY,                {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_POINT_KEY_NORM,             {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_POINT_KEY,                  {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_POINT_PAIR_NORM,            {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_POINT_SUB_QUERY,            {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_POINT_SIZE_UP,              {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_POINT_SIZE_DOWN,            {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_POINT_LOC_UP,               {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_POINT_LOC_DOWN,             {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_DENSE_2_OUT,                {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}}, // Dense layer output
     {LLM_TENSOR_DENSE_3_OUT,                {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}}, // Dense layer output
     {LLM_TENSOR_OUTPUT_NORM,                {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
@@ -1233,6 +1254,7 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_BAILINGMOE3:
         case LLM_ARCH_TILDE:
+        case LLM_ARCH_TILDE_OMNI:
         case LLM_ARCH_KIMI_K3:
         case LLM_ARCH_GLM5_NEXT:
         case LLM_ARCH_QWEN3TTS:

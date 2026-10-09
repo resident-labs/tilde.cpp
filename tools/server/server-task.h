@@ -198,6 +198,9 @@ struct server_task {
         // the scores are the first n_scores rows of the embeddings
         std::vector<int32_t> order;
         int32_t              n_scores = 0;
+        // the scores are the first n_scores values of the embeddings output read as one flat array (tilde omni:
+        // n_embd_out values per row), instead of the first value of the first n_scores rows
+        bool                 flat = false;
     };
     decision decision;
 

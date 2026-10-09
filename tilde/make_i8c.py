@@ -31,6 +31,9 @@ from gguf.quants import dequantize  # noqa: E402
 # 16-row beta and attention-gate projections stay Q8_0)
 DENSE = re.compile(r"^blk\.\d+\.(attn_q|attn_k|attn_v|attn_output|attn_q_a|attn_q_b|attn_kv_a_mqa|attn_kv_b|"
                    r"ssm_f_a|ssm_g_a|ffn_gate|ffn_up|ffn_down|ffn_gate_shexp|ffn_up_shexp|ffn_down_shexp)\.weight$")
+# tilde_omni (Qwen3.5): also the Gated DeltaNet in / gate / out projections (the 32-row alpha / beta stay Q8_0)
+DENSE_OMNI = re.compile(r"^blk\.\d+\.(attn_q|attn_k|attn_v|attn_output|attn_qkv|attn_gate|ssm_out|"
+                        r"ffn_gate|ffn_up|ffn_down)\.weight$")
 
 
 def to_f32(t) -> np.ndarray:
@@ -58,6 +61,7 @@ def main() -> None:
         sub_type = field.types[-1] if val_type == gguf.GGUFValueType.ARRAY else None
         writer.add_key_value(field.name, field.contents(), val_type, sub_type=sub_type)
     writer.add_string("tilde.weight_format", "i8c")
+    dense = DENSE_OMNI if arch == "tilde_omni" else DENSE
 
     plan = []
     for t in base.tensors:
@@ -68,7 +72,7 @@ def main() -> None:
                 parts = [src[t.name]]
             plan.append(("i8x", t.name, parts, 0))
             plan.append(("scalex", t.name.replace(".weight", ".scale"), parts, 0))
-        elif DENSE.match(t.name):
+        elif dense.match(t.name):
             if t.name not in src:
                 raise SystemExit(f"{t.name} missing in {args.bf16}")
             rows = int(t.shape[1]) if len(t.shape) >= 2 else 1

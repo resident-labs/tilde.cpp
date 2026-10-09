@@ -1,7 +1,8 @@
 set(TARGET tilde-eval)
 add_executable(${TARGET} tools/tilde-eval.cpp)
 install(TARGETS ${TARGET} RUNTIME)
-target_link_libraries(${TARGET} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
+target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR}/tools/mtmd ${PROJECT_SOURCE_DIR}/tools/server)
+target_link_libraries(${TARGET} PRIVATE mtmd llama-common llama ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
 set(TARGET tilde-encode)

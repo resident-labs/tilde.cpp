@@ -231,6 +231,16 @@ struct clip_graph_qwen3a : clip_graph {
     ggml_cgraph * build() override;
 };
 
+struct clip_graph_tilde_omni_v : clip_graph_qwen3vl {
+    clip_graph_tilde_omni_v(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph_qwen3vl(ctx, img) {}
+    ggml_cgraph * build() override;
+};
+
+struct clip_graph_tilde_omni_a : clip_graph {
+    clip_graph_tilde_omni_a(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
+    ggml_cgraph * build() override;
+};
+
 struct clip_graph_mimo_audio : clip_graph {
     clip_graph_mimo_audio(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
     ggml_cgraph * build() override;

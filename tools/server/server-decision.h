@@ -2,6 +2,8 @@
 
 #include "server-common.h"
 #include "server-task.h"
+#include "tilde-omni-image.h"
+#include "tilde-omni-point.h"
 
 #include <map>
 #include <memory>
@@ -15,6 +17,7 @@ enum server_decision_question_type {
     SERVER_DECISION_QUESTION_CHOICE,
     SERVER_DECISION_QUESTION_SCORE,
     SERVER_DECISION_QUESTION_NOUL,
+    SERVER_DECISION_QUESTION_POINT, // tilde omni: a location on an image (or not on screen)
 };
 
 struct server_decision_option {
@@ -33,6 +36,29 @@ struct server_decision_question {
     std::string              text;             // the instruction text given to the model
     std::vector<std::string> legend;           // score: the description of each level
     float                    noul_temperature = 0.0f; // noul: extra temperature for this answer, 0 if none
+    int                      image = -1;              // point: the image index
+};
+
+// tilde omni: the images of a request, as stored for the model (tilda.vision.budget) and their token layouts
+struct server_decision_media {
+    struct image {
+        std::string          label = "screenshot";
+        bool                 has_time = false;
+        double               time = 0.0;
+        int                  width = 0;  // original pixels
+        int                  height = 0;
+        std::vector<uint8_t> rgb;        // original pixels, then released once stored
+        tilde_omni::plan     plan;
+        std::vector<uint8_t> stored;     // plan.width x plan.height x 3
+        tilde_omni::layout   layout;
+    };
+    std::vector<image> images;
+    // audio clips, after the images (tilda.data.parse_row); whole clips, "Audio k: <label>"
+    struct audio {
+        std::string label = "audio";
+        raw_buffer  data;   // the file (wav / mp3 / flac)
+    };
+    std::vector<audio> audios;
 };
 
 struct server_decision_context {
@@ -65,6 +91,27 @@ struct server_decision_context {
     size_t max_questions       = 0; // 0: no limit
     size_t max_request_tokens  = 0; // state + all the questions
     size_t max_question_tokens = 0; // state + one question
+
+    // tilde omni: images (and the point question type) in the request
+    bool tilde_omni = false;
+
+    // tilde omni: the request's images, decoded, budgeted and stored (throws std::invalid_argument on bad input)
+    server_decision_media parse_media_tilde(const json & body, mtmd_context * mctx) const;
+
+    // tilde: the joint prompt with the request's media; the result is a flat array: every option's logit in order,
+    // then the point head's outputs of every point question in order
+    void fill_task_tilde(
+            const json & state,
+            const std::vector<server_decision_question> & questions,
+            const server_decision_media & media,
+            mtmd_context * mctx,
+            server_task & task) const;
+
+    // tilde: answers of all the questions from the flat result (and "images" for a request with images)
+    json format_answers_tilde(
+            const std::vector<server_decision_question> & questions,
+            const std::vector<float> & scores,
+            const server_decision_media & media) const;
 
     // true if the prompt of the model has a place for images
     bool can_use_images() const {
@@ -137,10 +184,10 @@ private:
     // TILDE
     llama_token              tilde_bos = LLAMA_TOKEN_NULL;
     std::vector<llama_token> tilde_markers; // start, state, state end, question, options, decision
+    std::vector<llama_token> tilde_media_ids; // omni: image start, image end, image token, point query, point none, audio start, audio end
     bool                     tilde_noul_normalize = false; // noul options are normalized (true first, default texts)
 
     std::vector<server_decision_question> parse_questions_tilde(const json & body) const;
-    void fill_task_tilde(const json & state, const std::vector<server_decision_question> & questions, server_task & task) const;
     json format_answer_tilde(const server_decision_question & question, const std::vector<float> & scores, json & answer) const;
 
     std::string render(

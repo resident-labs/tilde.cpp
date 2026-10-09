@@ -900,7 +900,9 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
 // add an encoded mtmd chunk to the batch of the text tokens, instead of decoding it on its own like process_mtmd_chunk()
 // embd is the output of the encoder for this chunk
 // returns false if the batch is full
-static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * chunk, const float * embd, server_batch & batch) {
+// orders: the decision order of each embedding entry (tilde omni media blocks), nullptr if none
+static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * chunk, const float * embd, server_batch & batch,
+        const int32_t * orders = nullptr) {
     // positions are the ones of mtmd_helper_decode_image_chunk()
     const auto * image    = mtmd_input_chunk_get_tokens_image(chunk);
     const bool   is_mrope = mtmd_decode_use_mrope(slot.mctx);
@@ -920,6 +922,9 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
         }
         if (!batch.add_embd(slot.id, embd + i * n_embd, pos, slot.need_embd(), /* is_prompt */ true)) {
             return false;
+        }
+        if (orders != nullptr) {
+            batch.set_decision_order(batch.size() - 1, orders[i]);
         }
     }
     return true;
@@ -2381,6 +2386,18 @@ private:
                 return i >= 0 && i < (int32_t) idx.size() ? llama_get_embeddings_ith(slot.ctx_tgt, idx[i]) : nullptr;
             };
 
+            // joint head (decision model), flat output: the first n_scores values of the slot's rows
+            if (decision.flat) {
+                const int32_t n_embd_out_flat = llama_model_n_embd_out(model_tgt);
+                const float * embd = idx.empty() ? nullptr : llama_get_embeddings_ith(slot.ctx_tgt, idx[0]);
+                if (embd == nullptr || (int64_t) idx.size() * n_embd_out_flat < decision.n_scores) {
+                    send_error(slot, "failed to get embeddings", ERROR_TYPE_SERVER);
+                    return;
+                }
+                res->scores.assign(embd, embd + decision.n_scores);
+                queue_results.send(std::move(res));
+                return;
+            }
             // joint head (decision model): the scores are the first rows
             for (int32_t i = 0; i < decision.n_scores; i++) {
                 const float * embd = i < (int32_t) idx.size() ? llama_get_embeddings_ith(slot.ctx_tgt, idx[i]) : nullptr;
@@ -3976,7 +3993,8 @@ private:
                 embd = res == 0 ? mtmd_batch_get_output_embd(slot.mbatch.get(), chunk.get()) : nullptr;
             }
 
-            if (!embd || !add_mtmd_chunk(slot, chunk.get(), embd, batch)) {
+            const int32_t * orders = slot.task->decision.order.empty() ? nullptr : slot.task->decision.order.data() + cur_token_idx;
+            if (!embd || !add_mtmd_chunk(slot, chunk.get(), embd, batch, orders)) {
                 SLT_ERR(slot, "%s", "failed to process mtmd chunk\n");
                 // the batch must not keep the entries of a released slot
                 batch.truncate(n_tokens_prev);
@@ -5627,6 +5645,9 @@ void server_routes::init_routes() {
 
         std::vector<raw_buffer> files;
         const json state = decision.parse_state(body, files);
+        // tilde: the request's images, stored as the model reads them (tilde omni)
+        const bool is_tilde = decision.type == COMMON_DECISION_TYPE_TILDE;
+        const server_decision_media media = is_tilde ? decision.parse_media_tilde(body, ctx_server.mctx) : server_decision_media();
         if (!files.empty() && (!decision.can_use_images() || !meta->has_inp_image)) {
             res->error(format_error_response("This server does not support image input for decisions. For a model that supports it, start it with `--mmproj`", ERROR_TYPE_NOT_SUPPORTED));
             return res;
@@ -5639,7 +5660,11 @@ void server_routes::init_routes() {
             if (decision.is_joint()) {
                 server_task task = server_task(SERVER_TASK_TYPE_DECISION);
                 task.id = rd.get_new_id();
-                decision.fill_task_joint(state, questions, files, ctx_server.mctx, ctx_server.init_opt, task);
+                if (is_tilde) {
+                    decision.fill_task_tilde(state, questions, media, ctx_server.mctx, task);
+                } else {
+                    decision.fill_task_joint(state, questions, files, ctx_server.mctx, ctx_server.init_opt, task);
+                }
                 tasks.push_back(std::move(task));
             } else {
                 for (const auto & question : questions) {
@@ -5667,10 +5692,26 @@ void server_routes::init_routes() {
         }
 
         json answers = json::object();
+        json images;
         int32_t n_tokens = 0;
         size_t i_result = 0;
         size_t i_score  = 0;
+        const bool flat_answers = is_tilde && decision.tilde_omni;
+        if (flat_answers) {
+            // one result, the options of every question then the point outputs (format_answers_tilde)
+            auto * result = dynamic_cast<server_task_result_decision *>(all_results.results[0].get());
+            GGML_ASSERT(result != nullptr);
+            json formatted = decision.format_answers_tilde(questions, result->scores, media);
+            answers = formatted.at("answers");
+            if (formatted.contains("images")) {
+                images = formatted.at("images");
+            }
+            n_tokens = result->n_tokens;
+        }
         for (const auto & question : questions) {
+            if (flat_answers) {
+                break;
+            }
             std::vector<std::vector<float>> scores;
             if (decision.is_joint()) {
                 // one result with the scores of all the questions, in order
@@ -5703,6 +5744,9 @@ void server_routes::init_routes() {
             out["latency_ms"] = std::round((ggml_time_us() - t_start_us) / 100.0) / 10.0;
             if (body.contains("request_id")) {
                 out["request_id"] = body.at("request_id");
+            }
+            if (!images.is_null()) {
+                out["images"] = images;
             }
         }
         res->ok(out);
