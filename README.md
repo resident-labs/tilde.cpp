@@ -221,8 +221,12 @@ joint_logit_scale(folded)), checked against the residual scorer (or state it wit
 
 Request additions (tilde omni):
 - `images`: a list of data URLs / base64 strings, or `{"data": ..., "label": "screenshot", "time": t, "max_cells": n}`;
-  `budget_cells` (default 2400) caps the request's image cells (tilda.vision.budget: images are scaled down, never up,
-  and padded to 32 px cells);
+  images are kept at their native size, padded up to 32 px cells; the server never downscales on its own.
+  `max_cells` (per image) and `image_max_cells` (all images; the item wins) and `budget_cells` (whole request,
+  tilda.vision.budget water-filling) are optional client opt-ins to downscale (training used 1200 cells per image;
+  native resolution roughly doubles ScreenSpot-Pro accuracy, .255 at 1200 cells vs .510 native). The only limits are
+  the pixel limits (40 Mpx per image, 120 Mpx per request) and the request token limit (1 token per 32x32 cell): a
+  request over it gets a 400 naming its size, never a silent shrink;
 - `audio`: a list of data URLs / base64 strings (wav, mp3, flac) or `{"data": ..., "label": "audio"}`, whole clips;
 - a question `{"type": "point", "instructions": "...", "image": 0}` answers with `x`, `y` (original pixels), `none`,
   `p_none`, `p_token`, `p_blob`, `p_elsewhere`, `width`, `height`, `top` (8 most likely tokens), `p_blob_t` and

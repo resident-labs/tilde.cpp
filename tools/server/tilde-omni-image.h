@@ -14,7 +14,8 @@
 
 namespace tilde_omni {
 
-constexpr int MAX_CELLS = 1200; // per image
+constexpr int TRAIN_CELLS = 1200;      // the training-time per-image cap; only a client opt-in now (max_cells), never a default
+constexpr int HARD_MAX_CELLS = 1 << 20; // no cap by default: images keep their native size (the pixel + token limits bound them)
 constexpr int MIN_SIDE  = 64;   // px, the smallest short side a shrunk image keeps
 
 struct plan {
@@ -50,7 +51,7 @@ inline plan fit(int w, int h, double max_cells) {
     if (w < 1 || h < 1) {
         throw std::invalid_argument("empty image");
     }
-    max_cells = std::max(1.0, std::min(max_cells, (double) MAX_CELLS));
+    max_cells = std::max(1.0, std::min(max_cells, (double) HARD_MAX_CELLS));
     double scale = std::min(1.0, std::sqrt(max_cells * 32 * 32 / ((double) w * h)));
     plan p = make_plan(w, h, scale);
     while (p.cells() > max_cells && p.scale > 1e-3) {
@@ -63,11 +64,11 @@ inline plan fit(int w, int h, double max_cells) {
 
 // times: empty, or one per image (recency-weighted shares, halving every `halflife`)
 inline std::vector<plan> allocate(const std::vector<std::pair<int, int>> & sizes, int budget_cells,
-        const std::vector<double> & times = {}, double halflife = 2.0) {
+        const std::vector<double> & times = {}, double halflife = 2.0, const std::vector<int> & caps = {}) {
     std::vector<plan> natural;
     int total = 0;
     for (const auto & [w, h] : sizes) {
-        natural.push_back(fit(w, h, MAX_CELLS));
+        natural.push_back(fit(w, h, caps.empty() ? HARD_MAX_CELLS : caps[natural.size()]));
         total += natural.back().cells();
     }
     if (total <= budget_cells) {

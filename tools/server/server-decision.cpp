@@ -1,5 +1,6 @@
 #include "server-decision.h"
 
+#include <limits>
 #include "../../src/llama-ext.h" // staging API: llama_decision_order
 
 #include <algorithm>
@@ -1537,8 +1538,9 @@ void server_decision_context::fill_task_tilde(
     marker(5);
 
     if (max_request_tokens > 0 && tokens.size() > max_request_tokens) {
-        throw std::invalid_argument(string_format("request is %zu tokens (state + schema); this server accepts at most %zu tokens per request",
-                tokens.size(), max_request_tokens));
+        throw std::invalid_argument(string_format("request is %zu tokens (state + schema); this server accepts at most %zu tokens per request%s",
+                tokens.size(), max_request_tokens,
+                tilde_omni ? " (images are kept at native size, 1 token per 32x32 px cell; send a smaller image, or set max_cells / budget_cells to downscale)" : ""));
     }
     // the head writes every output into the embeddings output, n_embd_out values per token (tilde omni: 4)
     if (tilde_omni && n_scores > 4 * tokens.size()) {
@@ -1647,7 +1649,7 @@ json server_decision_context::format_answer_tilde(const server_decision_question
 //
 
 // "images": [image, ...], each a data URL / base64 string or {"data": ..., "label": "screenshot", "time": t,
-// "max_cells": n}; "budget_cells": cells for the whole request (default 2400; tilda.vision.budget.allocate)
+// "max_cells": n}; "image_max_cells": per-image cap for all; "budget_cells": cells for the whole request (tilda.vision.budget.allocate); all three are optional client opt-ins to downscale, the default is native size padded to 32 px
 server_decision_media server_decision_context::parse_media_tilde(const json & body, mtmd_context * mctx) const {
     server_decision_media media;
     // "audio": [clip, ...], each a data URL / base64 string or {"data": ..., "label": "audio"}
@@ -1763,12 +1765,20 @@ server_decision_media server_decision_context::parse_media_tilde(const json & bo
     if (images.size() > (size_t) LLAMA_DECISION_ORDER_MAX_IMAGES) {
         throw std::invalid_argument(string_format("at most %d images", (int) LLAMA_DECISION_ORDER_MAX_IMAGES));
     }
-    int budget_cells = 2400;
+    int budget_cells = std::numeric_limits<int>::max(); // no budget unless the client asks
     if (body.contains("budget_cells") && !body.at("budget_cells").is_null()) {
         if (!body.at("budget_cells").is_number_integer() || body.at("budget_cells").get<int>() < 1) {
             throw std::invalid_argument("budget_cells must be a positive integer");
         }
         budget_cells = body.at("budget_cells").get<int>();
+    }
+    // "image_max_cells": a request-level per-image cap (default: none); an image's own max_cells wins
+    int default_cap = tilde_omni::HARD_MAX_CELLS;
+    if (body.contains("image_max_cells") && !body.at("image_max_cells").is_null()) {
+        if (!body.at("image_max_cells").is_number_integer() || body.at("image_max_cells").get<int>() < 1) {
+            throw std::invalid_argument("image_max_cells must be a positive integer");
+        }
+        default_cap = std::min(body.at("image_max_cells").get<int>(), tilde_omni::HARD_MAX_CELLS);
     }
     std::vector<std::pair<int, int>> sizes;
     std::vector<double> times;
@@ -1842,7 +1852,7 @@ server_decision_media server_decision_context::parse_media_tilde(const json & bo
             img.prestored = true;
             img.prestored_scale = item.at("stored_scale").get<double>();
         }
-        int cap = tilde_omni::MAX_CELLS;
+        int cap = default_cap;
         if (item.is_object()) {
             if (item.contains("label") && item.at("label").is_string() && !item.at("label").get<std::string>().empty()) {
                 img.label = item.at("label").get<std::string>();
@@ -1859,7 +1869,7 @@ server_decision_media server_decision_context::parse_media_tilde(const json & bo
                 if (!item.at("max_cells").is_number_integer() || item.at("max_cells").get<int>() < 1) {
                     throw std::invalid_argument(string_format("images[%zu]: max_cells must be a positive integer", i));
                 }
-                cap = item.at("max_cells").get<int>();
+                cap = std::min(item.at("max_cells").get<int>(), tilde_omni::HARD_MAX_CELLS);
             }
         }
         sizes.push_back({ img.width, img.height });
@@ -1870,7 +1880,7 @@ server_decision_media server_decision_context::parse_media_tilde(const json & bo
     if (n_timed != 0 && n_timed != images.size()) {
         throw std::invalid_argument("give every image a time, or none");
     }
-    auto plans = tilde_omni::allocate(sizes, budget_cells, n_timed ? times : std::vector<double>());
+    auto plans = tilde_omni::allocate(sizes, budget_cells, n_timed ? times : std::vector<double>(), 2.0, caps);
     for (size_t i = 0; i < plans.size(); i++) {
         if (plans[i].cells() > caps[i]) {
             plans[i] = tilde_omni::fit(sizes[i].first, sizes[i].second, caps[i]);
@@ -1881,9 +1891,9 @@ server_decision_media server_decision_context::parse_media_tilde(const json & bo
             // as given (padded to 32 px cells), with the client's scale
             img.plan = tilde_omni::make_plan(img.width, img.height, 1.0);
             img.plan.scale = img.prestored_scale;
-            if (img.plan.cells() > std::min(caps[i], tilde_omni::MAX_CELLS)) {
+            if (img.plan.cells() > caps[i]) {
                 throw std::invalid_argument(string_format("images[%zu]: a stored_scale image is over %d cells of 32 px",
-                    i, std::min(caps[i], tilde_omni::MAX_CELLS)));
+                    i, caps[i]));
             }
         }
         img.stored = tilde_omni::render(img.rgb, img.width, img.height, img.plan);
