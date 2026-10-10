@@ -1881,6 +1881,16 @@ server_decision_media server_decision_context::parse_media_tilde(const json & bo
         throw std::invalid_argument("give every image a time, or none");
     }
     auto plans = tilde_omni::allocate(sizes, budget_cells, n_timed ? times : std::vector<double>(), 2.0, caps);
+    {
+        size_t cells = 0;
+        for (size_t i = 0; i < plans.size(); i++) {
+            cells += (size_t) std::min(plans[i].cells(), caps[i]);
+        }
+        if (max_request_tokens > 0 && cells > max_request_tokens) {
+            throw std::invalid_argument(string_format("the images are %zu tokens at native size (1 token per 32x32 px cell); this server accepts at most %zu tokens per request: send a smaller image, or set max_cells / budget_cells to downscale",
+                    cells, max_request_tokens));
+        }
+    }
     for (size_t i = 0; i < plans.size(); i++) {
         if (plans[i].cells() > caps[i]) {
             plans[i] = tilde_omni::fit(sizes[i].first, sizes[i].second, caps[i]);
