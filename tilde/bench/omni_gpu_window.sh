@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One GPU window on a shared box (hermeslab): stop tilde-server, run the given steps, ALWAYS restart tilde-server
+# One GPU window on a shared box: stop tilde-server, run the given steps, ALWAYS restart tilde-server
 # (trap EXIT), log the outage length. Run detached: setsid nohup bash omni_gpu_window.sh STEP... > LOG 2>&1 < /dev/null &
 #
 # Steps (in order given):
@@ -16,7 +16,7 @@ RECORDS=${RECORDS:-$ROOT/parity/omni_gpu_sub.jsonl}
 OUT=${OUT:-$ROOT/parity}
 MODELS=${MODELS:-$ROOT/models}
 BIN=${BIN:-$ROOT/tilde.cpp/build-cuda/bin}
-PY=${PY:-/home/pip/clef_audit_20261006/.venv/bin/python}
+PY=${PY:-python3}
 export TILDA_CODE=${TILDA_CODE:-$ROOT/tilda-train-ro}
 TEMPERATURE=${TEMPERATURE:-1.40}
 BASE=${BASE:-$ROOT/base}

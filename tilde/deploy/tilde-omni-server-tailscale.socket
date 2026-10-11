@@ -1,8 +1,8 @@
 [Unit]
-Description=Tilde Omni server on the Tailscale address (100.122.131.34:18797, forwarded to 127.0.0.1:18797)
+Description=Tilde Omni server on the Tailscale address (your tailnet address, port 18797, forwarded to 127.0.0.1:18797)
 
 [Socket]
-ListenStream=100.122.131.34:18797
+ListenStream=100.x.y.z:18797
 FreeBind=true
 
 [Install]

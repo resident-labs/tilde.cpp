@@ -198,51 +198,6 @@ and MXFP4E (measured as W4A8 on Ampere) are within 1 point and +0.01.
 
 See [STATUS.md](STATUS.md). All numbers there are measured; none are extrapolated.
 
-## Tilde Omni (tilde-4b-omni, in progress)
-
-`tilde_omni` serves Tilde trained on TLive-Omni-4B (Qwen3.5-4B text decoder, Qwen3.5 ViT, AuT audio tower): the same
-`/v1/systemone` API plus images, audio and a `point` question type. Status and numbers: STATUS.md, "Tilde Omni".
-
-```sh
-python tilde/convert_tilde_omni_to_gguf.py --base TLive-Omni-4B/ --checkpoint final_folded/ --temperature 1.40 \
-    --unfolded-head final/joint_head.safetensors --outtype bf16 --outfile tilde-4b-omni-BF16.gguf
-python tilde/convert_tilde_omni_mmproj.py --base TLive-Omni-4B/ --checkpoint final_folded/ --outfile mmproj-tilde-4b-omni-F16.gguf
-build/bin/llama-quantize --token-embedding-type bf16 --output-tensor-type bf16 \
-    --tensor-type '^(decision\.|dec\.|token_types|point\.)=f32' tilde-4b-omni-BF16.gguf tilde-4b-omni-Q8_0.gguf Q8_0 8
-```
-
-Temperature: `--temperature` is the total temperature to serve at (1.40, the full-DEV fit). The converter folds only
-what the checkpoint does not already hold, and measures that from the heads rather than trusting report.json:
-`--unfolded-head` (the unfolded `final/joint_head.safetensors`) gives T_ckpt = exp(joint_logit_scale(final) -
-joint_logit_scale(folded)), checked against the residual scorer (or state it with `--checkpoint-temperature`). The HF
-`omni_full_tlive4b_20261007/final_folded` of 2026-10-07 holds T = 1.28 (a quick text-DEV fit), so the converter folds
-1.40 / 1.28 = 1.09375 (metadata `tilde.checkpoint_temperature` 1.28, `tilde.temperature_folded` 1.40); a re-folded
-`final_folded` at 1.40 gets nothing more, so a re-fetch cannot double-fold. Nothing is applied at serving time.
-
-Request additions (tilde omni):
-- `images`: a list of data URLs / base64 strings, or `{"data": ..., "label": "screenshot", "time": t, "max_cells": n}`;
-  images are kept at their native size, padded up to 32 px cells; the server never downscales on its own.
-  `max_cells` (per image) and `image_max_cells` (all images; the item wins) and `budget_cells` (whole request,
-  tilda.vision.budget water-filling) are optional client opt-ins to downscale (training used 1200 cells per image;
-  native resolution roughly doubles ScreenSpot-Pro accuracy, .255 at 1200 cells vs .510 native). The only limits are
-  the pixel limits (40 Mpx per image, 120 Mpx per request) and the request token limit (1 token per 32x32 cell): a
-  request over it gets a 400 naming its size, never a silent shrink;
-- `audio`: a list of data URLs / base64 strings (wav, mp3, flac) or `{"data": ..., "label": "audio"}`, whole clips;
-- a question `{"type": "point", "instructions": "...", "image": 0}` answers with `x`, `y` (original pixels), `none`,
-  `p_none`, `p_token`, `p_blob`, `p_elsewhere`, `width`, `height`, `top` (8 most likely tokens), `p_blob_t` and
-  `stored_xy`, as the reference browser server (tilda.agents.browser.serve) does; the response adds `images` (scale,
-  stored size and tokens of each image).
-- Media order: `media_order` `"time"` (images and clips sorted by their `time`, an image before a clip at equal
-  time, as the training rows with `"media_order": "time"`), `"row"` (every image, then every clip). Default: by time
-  when every image and clip has a `time`, else row. `media_layout`: `"blocks"` (default; a header line per block,
-  `Image k: <label>` / `Audio k: <label>`) or `"stream"` (no header lines; Qwen-style video).
-- Video: an image item with `"frames": [first, second]` is one temporal pair (2 fps); `"stored_scale": s` marks an
-  image already at its stored size (s = stored / original pixels; no resize). Audio items take `time` and a slice
-  `start` / `end` in seconds (the whole clip is encoded once per window and the slice's tokens kept, 13 per second); `"clip": j`
-  instead of `data` takes the file of audio item j (send a clip once, slice it many times).
-- webp images get HTTP 415.
-- Limits: 48 MB of base64 per image or clip, 40 Mpx per image, 120 Mpx per request, 32 images, 256 audio items, 3,600 s of audio to process (clip length summed over its slices).
-
 ## License
 
 MIT, like llama.cpp (see LICENSE). The model weights carry their own license on Hugging Face.
