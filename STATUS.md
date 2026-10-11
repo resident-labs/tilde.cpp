@@ -1,6 +1,6 @@
 # tilde.cpp status
 
-Last updated 2026-10-08 08:45 CDT (commit ab5d070a2). Every number below was measured on hermeslab (RTX 3090 Ti 24 GB,
+Last updated 2026-10-08 08:45 CDT (commit ab5d070a2). Every number below was measured on our test machine (RTX 3090 Ti 24 GB,
 i7-12700K, CUDA 13.1) unless marked as the RTX 5090 run. Nothing is extrapolated.
 
 ## Where we are
@@ -153,7 +153,7 @@ f16 temporaries, int8 rows from SwiGLU and norms) -> 1,180 (I8CX+FAST).
 ## RTX 5090 (Vast, Ryzen 9 9950X, CUDA 12.8, arch 120a; run 2026-10-08 08:34 CDT, commit ab5d070a2)
 
 `tilde/bench/run_gpu_box.sh` on a fresh box; all kernel tests pass. Parity on the 400-record public-source DEV slice
-(the full DEV set stays on hermeslab), latency with tilde-eval (warm, best of 3, ms):
+(the full DEV set stays on the test machine), latency with tilde-eval (warm, best of 3, ms):
 
 | preset | 1k | 4k | 16k | 32k | 64k (1q) | slice accuracy | log loss | mean \|dp\| | peak VRAM |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
